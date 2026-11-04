@@ -16,10 +16,15 @@ public:
     static constexpr const char* kSharedWasapi = "Windows Audio";
     static constexpr const char* kExclusiveWasapi = "Windows Audio (Exclusive Mode)";
 
+    static constexpr int kDefaultLatencyMs = 100;
+    static constexpr int kDefaultWasapiBuffer = 512;
+    static constexpr int kMinLatencyMs = 40;
+    static constexpr int kMaxLatencyMs = 250;
+
     struct DeviceInfo
     {
         juce::String name;
-        juce::String typeName; // WASAPI type, or "Aggregate" for virtual entry
+        juce::String typeName;
         int inputChannels = 0;
         double sampleRate = 0.0;
         bool isAggregate = false;
@@ -31,7 +36,17 @@ public:
     void refreshDeviceList();
     juce::Array<DeviceInfo> getDevices() const;
 
-    /** Open by combo name. Aggregate name opens all six IN pairs (shared WASAPI). */
+    /** Target FIFO depth (ms) before audio starts + drift waterline. Applied on next open. */
+    void setLatencyMs (int ms) noexcept;
+    int getLatencyMs() const noexcept { return latencyMs; }
+
+    /** WASAPI period hint for all pairs (256/512/1024…). Applied on next open. */
+    void setWasapiBufferSize (int samples) noexcept;
+    int getWasapiBufferSize() const noexcept { return wasapiBufferSize; }
+
+    int getTargetFillSamples() const noexcept;
+    int getPrimingTargetSamples() const noexcept;
+
     juce::String openDevice (const juce::String& deviceName,
                              double preferredSampleRate,
                              int preferredBufferSize);
@@ -39,6 +54,8 @@ public:
     void closeDevice();
     bool isOpen() const noexcept;
     bool isAggregateOpen() const noexcept { return aggregateOpen; }
+    bool isPrimed() const noexcept { return primed.load (std::memory_order_relaxed); }
+    void resetPrime() noexcept { primed.store (false, std::memory_order_relaxed); }
 
     juce::String getCurrentDeviceName() const;
     int getCaptureChannelCount() const noexcept { return captureChannels; }
@@ -49,10 +66,13 @@ public:
     juce::String getOpenPairSummary() const;
 
     int getAvailableToRead() const noexcept;
+    /** Non-blocking read with per-pair slip (drop) / pad (soft underrun). */
     void readStems (float* const* dst, int numSamples) noexcept;
 
     int getUnderruns() const noexcept;
     int getOverruns() const noexcept;
+    int getSlips() const noexcept;
+    void clearXrunCounters() noexcept;
 
     float getPeak (int channel) const noexcept;
     void decayPeaks (float factor) noexcept;
@@ -62,10 +82,10 @@ public:
 
     juce::String getLastError() const { return lastError; }
 
-    /** Parse "IN 1-2 (TR-8S)" → pair index 0..5, or -1 if not a stem pair. */
     static int pairIndexFromDeviceName (const juce::String& name);
     static bool isTr8sFamily (const juce::String& name);
     static bool isTr8sMix (const juce::String& name);
+    static int snapWasapiBuffer (int samples) noexcept;
 
 private:
     struct PairEndpoint;
@@ -76,13 +96,16 @@ private:
                              const juce::String& typeName,
                              double preferredSampleRate,
                              int preferredBufferSize);
-    void prepareRings (double sampleRate);
+    int ringCapacityForRate (double sampleRate) const noexcept;
     juce::Array<DeviceInfo> discoverPhysicalDevices() const;
 
     std::array<std::unique_ptr<PairEndpoint>, kNumPairs> pairs;
-    std::unique_ptr<PairEndpoint> single; // non-aggregate / MIX / lone pair
+    std::unique_ptr<PairEndpoint> single;
 
     bool aggregateOpen = false;
+    std::atomic<bool> primed { false };
+    int latencyMs = kDefaultLatencyMs;
+    int wasapiBufferSize = kDefaultWasapiBuffer;
     int captureChannels = 0;
     double captureSampleRate = 0.0;
     int captureBufferSize = 0;

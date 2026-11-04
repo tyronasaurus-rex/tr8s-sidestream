@@ -36,7 +36,7 @@ void TR8SSideStreamProcessor::prepareToPlay (double sampleRate, int samplesPerBl
 {
     hostSampleRate = sampleRate;
     hostBlockSize = samplesPerBlock;
-    primed = false;
+    capture.resetPrime();
 
     setLatencySamples (capture.isOpen() ? capture.getReportedLatencySamples() : 0);
 
@@ -49,7 +49,7 @@ void TR8SSideStreamProcessor::prepareToPlay (double sampleRate, int samplesPerBl
 
 void TR8SSideStreamProcessor::releaseResources()
 {
-    primed = false;
+    capture.resetPrime();
 }
 
 bool TR8SSideStreamProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -70,11 +70,6 @@ bool TR8SSideStreamProcessor::isBusesLayoutSupported (const BusesLayout& layouts
     return true;
 }
 
-int TR8SSideStreamProcessor::getPrimingTarget() const noexcept
-{
-    return juce::jmax (hostBlockSize * 2, capture.getCaptureBufferSize());
-}
-
 void TR8SSideStreamProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midi)
 {
     juce::ignoreUnused (midi);
@@ -86,14 +81,6 @@ void TR8SSideStreamProcessor::processBlock (juce::AudioBuffer<float>& buffer, ju
     if (! capture.isOpen() || numSamples <= 0)
         return;
 
-    // Spike: 1:1 sample copy — match Live and Roland panel sample rates.
-    if (! primed)
-    {
-        if (capture.getAvailableToRead() < getPrimingTarget())
-            return;
-        primed = true;
-    }
-
     juce::AudioBuffer<float> temp (kNumStems, numSamples);
     temp.clear();
 
@@ -101,6 +88,7 @@ void TR8SSideStreamProcessor::processBlock (juce::AudioBuffer<float>& buffer, ju
     for (int i = 0; i < kNumStems; ++i)
         chPtrs[i] = temp.getWritePointer (i);
 
+    // Non-blocking: pre-roll inside readStems; per-pair slip/pad for drift.
     capture.readStems (chPtrs, numSamples);
 
     for (int bus = 0; bus < kNumStems; ++bus)
@@ -121,6 +109,8 @@ void TR8SSideStreamProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
     juce::ValueTree state ("TR8SSideStream");
     state.setProperty ("device", preferredDevice, nullptr);
+    state.setProperty ("latencyMs", capture.getLatencyMs(), nullptr);
+    state.setProperty ("wasapiBuffer", capture.getWasapiBufferSize(), nullptr);
     if (auto xml = state.createXml())
         copyXmlToBinary (*xml, destData);
 }
@@ -131,6 +121,8 @@ void TR8SSideStreamProcessor::setStateInformation (const void* data, int sizeInB
     {
         const auto state = juce::ValueTree::fromXml (*xml);
         preferredDevice = state.getProperty ("device", {}).toString();
+        capture.setLatencyMs ((int) state.getProperty ("latencyMs", WasapiCapture::kDefaultLatencyMs));
+        capture.setWasapiBufferSize ((int) state.getProperty ("wasapiBuffer", WasapiCapture::kDefaultWasapiBuffer));
     }
 }
 

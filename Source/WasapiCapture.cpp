@@ -1,5 +1,6 @@
 #include "WasapiCapture.h"
 #include <climits>
+#include <cmath>
 
 namespace
 {
@@ -44,11 +45,16 @@ struct WasapiCapture::PairEndpoint final : private juce::AudioIODeviceCallback
         // Calling setAudioDeviceSetup alone hits getCurrentDeviceTypeObject()==nullptr and
         // JUCE returns {} while leaving the device null — which produced
         // "Opened null device: IN X-Y (TR-8S)" for all six aggregate pairs.
+        // Prefer plugin WASAPI period; fall back to host hint. Same value used for all pairs.
+        const int period = WasapiCapture::snapWasapiBuffer (
+            owner.wasapiBufferSize > 0 ? owner.wasapiBufferSize
+                                       : (preferredBufferSize > 0 ? preferredBufferSize : kDefaultWasapiBuffer));
+
         juce::AudioDeviceManager::AudioDeviceSetup setup;
         setup.inputDeviceName = deviceName;
         setup.outputDeviceName.clear();
         setup.sampleRate = preferredSampleRate > 0.0 ? preferredSampleRate : 48000.0;
-        setup.bufferSize = preferredBufferSize > 0 ? preferredBufferSize : 512;
+        setup.bufferSize = period;
         setup.useDefaultInputChannels = true;
         setup.useDefaultOutputChannels = false;
         setup.outputChannels.clear();
@@ -106,7 +112,21 @@ struct WasapiCapture::PairEndpoint final : private juce::AudioIODeviceCallback
         if (activeChannels <= 0)
             return "Device open but 0 input channels: " + deviceName;
 
-        const int ringSize = juce::jmax (8192, (int) std::ceil (sampleRate * 0.25));
+        // Re-assert period if driver ignored our request.
+        if (std::abs (bufferSize - period) > 8)
+        {
+            auto again = manager.getAudioDeviceSetup();
+            again.bufferSize = period;
+            again.sampleRate = setup.sampleRate;
+            manager.setAudioDeviceSetup (again, true);
+            if (auto* d2 = manager.getCurrentAudioDevice())
+            {
+                bufferSize = d2->getCurrentBufferSizeSamples();
+                sampleRate = d2->getCurrentSampleRate();
+            }
+        }
+
+        const int ringSize = owner.ringCapacityForRate (sampleRate);
         ring.resize (2, ringSize);
         ring.reset();
         ring.clearCounters();
@@ -226,6 +246,53 @@ int WasapiCapture::pairIndexFromDeviceName (const juce::String& name)
     return -1;
 }
 
+int WasapiCapture::snapWasapiBuffer (int samples) noexcept
+{
+    static constexpr int choices[] = { 128, 256, 512, 1024, 2048 };
+    int best = 512;
+    int bestDist = INT_MAX;
+    for (int c : choices)
+    {
+        const int d = std::abs (c - samples);
+        if (d < bestDist)
+        {
+            bestDist = d;
+            best = c;
+        }
+    }
+    return best;
+}
+
+void WasapiCapture::setLatencyMs (int ms) noexcept
+{
+    latencyMs = juce::jlimit (kMinLatencyMs, kMaxLatencyMs, ms);
+}
+
+void WasapiCapture::setWasapiBufferSize (int samples) noexcept
+{
+    wasapiBufferSize = snapWasapiBuffer (samples);
+}
+
+int WasapiCapture::getTargetFillSamples() const noexcept
+{
+    const double rate = captureSampleRate > 0.0 ? captureSampleRate : 48000.0;
+    return juce::jmax (256, (int) std::lround (rate * (double) latencyMs / 1000.0));
+}
+
+int WasapiCapture::getPrimingTargetSamples() const noexcept
+{
+    // Pre-roll to full target depth before consuming (plus one WASAPI period).
+    return getTargetFillSamples() + juce::jmax (captureBufferSize, wasapiBufferSize);
+}
+
+int WasapiCapture::ringCapacityForRate (double sampleRate) const noexcept
+{
+    const double rate = sampleRate > 0.0 ? sampleRate : 48000.0;
+    const int target = juce::jmax (256, (int) std::lround (rate * (double) latencyMs / 1000.0));
+    // Hold ~1s, at least 4× latency target.
+    return juce::jmax (16384, target * 4, (int) std::lround (rate * 1.0));
+}
+
 WasapiCapture::WasapiCapture()
 {
     for (auto& p : peaks)
@@ -316,12 +383,6 @@ juce::Array<WasapiCapture::DeviceInfo> WasapiCapture::getDevices() const
 {
     const juce::ScopedLock sl (deviceListLock);
     return devices;
-}
-
-void WasapiCapture::prepareRings (double sampleRate)
-{
-    juce::ignoreUnused (sampleRate);
-    // Per-endpoint rings are sized in PairEndpoint::open.
 }
 
 juce::String WasapiCapture::openAggregate (double preferredSampleRate, int preferredBufferSize)
@@ -428,11 +489,15 @@ juce::String WasapiCapture::openAggregate (double preferredSampleRate, int prefe
     }
 
     aggregateOpen = true;
+    primed.store (false, std::memory_order_relaxed);
     captureChannels = opened * 2;
     captureSampleRate = rate;
     captureBufferSize = buf;
     deviceLatencyIn = latency;
-    currentName = juce::String (kAggregateName) + " (" + juce::String (opened) + " pairs)";
+    currentName = juce::String (kAggregateName) + " (" + juce::String (opened) + " pairs"
+                  + ", WASAPI " + juce::String (wasapiBufferSize)
+                  + ", depth " + juce::String (latencyMs) + "ms)";
+    clearXrunCounters();
     notifyStatus();
     return opened == kNumPairs ? juce::String() : lastError;
 }
@@ -477,6 +542,15 @@ juce::String WasapiCapture::openDevice (const juce::String& deviceName,
                                         double preferredSampleRate,
                                         int preferredBufferSize)
 {
+    // Keep all pairs on one snapped WASAPI period (UI setting wins; else host block).
+    if (wasapiBufferSize <= 0 && preferredBufferSize > 0)
+        wasapiBufferSize = snapWasapiBuffer (preferredBufferSize);
+    else
+        wasapiBufferSize = snapWasapiBuffer (wasapiBufferSize > 0 ? wasapiBufferSize
+                                                                  : kDefaultWasapiBuffer);
+
+    primed.store (false, std::memory_order_relaxed);
+
     if (deviceName == kAggregateName
         || deviceName.startsWith (kAggregateName))
     {
@@ -512,6 +586,7 @@ void WasapiCapture::closeDevice()
     }
 
     aggregateOpen = false;
+    primed.store (false, std::memory_order_relaxed);
     captureChannels = 0;
     captureSampleRate = 0.0;
     captureBufferSize = 0;
@@ -573,8 +648,7 @@ juce::String WasapiCapture::getCurrentDeviceName() const
 
 int WasapiCapture::getReportedLatencySamples() const noexcept
 {
-    const int ringPad = juce::jmax (captureBufferSize * 2, 1024);
-    return deviceLatencyIn + ringPad;
+    return deviceLatencyIn + getTargetFillSamples() + juce::jmax (captureBufferSize, wasapiBufferSize);
 }
 
 int WasapiCapture::getAvailableToRead() const noexcept
@@ -604,36 +678,71 @@ void WasapiCapture::readStems (float* const* dst, int numSamples) noexcept
     if (dst == nullptr || numSamples <= 0)
         return;
 
-    // Clear all stems first.
     for (int ch = 0; ch < kMaxChannels; ++ch)
         if (dst[ch] != nullptr)
             juce::FloatVectorOperations::clear (dst[ch], numSamples);
+
+    const int target = getTargetFillSamples();
+    const int highWater = target + juce::jmax (numSamples * 2, wasapiBufferSize * 2);
+
+    auto readOne = [&] (PairEndpoint& ep, float* left, float* right)
+    {
+        if (! ep.isOpen())
+            return;
+
+        float* pairDst[2] = { left, right };
+        int avail = ep.ring.getAvailableToRead();
+
+        // Fast capture clock vs host: discard down toward target (non-blocking slip).
+        if (avail > highWater)
+        {
+            ep.ring.discard (avail - target);
+            avail = ep.ring.getAvailableToRead();
+        }
+
+        if (avail >= numSamples)
+        {
+            ep.ring.read (pairDst, numSamples);
+        }
+        else if (avail > 0)
+        {
+            // Partial: read what we have, leave the rest silent (already cleared).
+            ep.ring.read (pairDst, avail);
+            // Soft underrun already counted inside read when it runs short — avoid double-count
+            // by reading only avail; ring.read won't underrun if avail > 0 and we ask for avail.
+        }
+        else
+        {
+            ep.ring.read (pairDst, numSamples); // counts one underrun, zeros
+        }
+    };
+
+    if (! primed.load (std::memory_order_relaxed))
+    {
+        if (getAvailableToRead() < getPrimingTargetSamples())
+            return; // stay silent until safe depth on every open pair
+        primed.store (true, std::memory_order_relaxed);
+        clearXrunCounters();
+    }
 
     if (aggregateOpen)
     {
         for (int i = 0; i < kNumPairs; ++i)
         {
             auto& p = pairs[(size_t) i];
-            if (p == nullptr || ! p->isOpen())
+            if (p == nullptr)
                 continue;
-
-            float* pairDst[2] = {
-                dst[i * 2],
-                dst[i * 2 + 1]
-            };
-            p->ring.read (pairDst, numSamples);
+            readOne (*p, dst[i * 2], dst[i * 2 + 1]);
         }
         return;
     }
 
-    if (single != nullptr && single->isOpen())
+    if (single != nullptr)
     {
         const int off = single->channelOffset;
-        float* pairDst[2] = {
-            (off < kMaxChannels ? dst[off] : nullptr),
-            (off + 1 < kMaxChannels ? dst[off + 1] : nullptr)
-        };
-        single->ring.read (pairDst, numSamples);
+        readOne (*single,
+                 off < kMaxChannels ? dst[off] : nullptr,
+                 off + 1 < kMaxChannels ? dst[off + 1] : nullptr);
     }
 }
 
@@ -667,6 +776,31 @@ int WasapiCapture::getOverruns() const noexcept
         n = single->ring.getOverruns();
     }
     return n;
+}
+
+int WasapiCapture::getSlips() const noexcept
+{
+    int n = 0;
+    if (aggregateOpen)
+    {
+        for (auto& p : pairs)
+            if (p != nullptr)
+                n += p->ring.getSlips();
+    }
+    else if (single != nullptr)
+    {
+        n = single->ring.getSlips();
+    }
+    return n;
+}
+
+void WasapiCapture::clearXrunCounters() noexcept
+{
+    for (auto& p : pairs)
+        if (p != nullptr)
+            p->ring.clearCounters();
+    if (single != nullptr)
+        single->ring.clearCounters();
 }
 
 float WasapiCapture::getPeak (int channel) const noexcept

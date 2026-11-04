@@ -11,7 +11,7 @@ public:
     void resize (int numChannels, int capacitySamples)
     {
         jassert (numChannels > 0);
-        jassert (capacitySamples > 0);
+        jassert (capacitySamples > 1);
 
         channels = numChannels;
         capacity = capacitySamples;
@@ -20,6 +20,7 @@ public:
         readIndex.store (0, std::memory_order_relaxed);
         underruns.store (0, std::memory_order_relaxed);
         overruns.store (0, std::memory_order_relaxed);
+        slips.store (0, std::memory_order_relaxed);
     }
 
     int getNumChannels() const noexcept { return channels; }
@@ -37,7 +38,24 @@ public:
         return capacity - 1 - getAvailableToRead();
     }
 
-    /** Producer (capture thread): write planar channel pointers. */
+    /** Drop oldest samples (advance read). Used for overrun recovery + drift catch-up. */
+    int discard (int numSamples) noexcept
+    {
+        if (numSamples <= 0 || capacity <= 0)
+            return 0;
+
+        const int avail = getAvailableToRead();
+        const int n = juce::jmin (numSamples, avail);
+        if (n <= 0)
+            return 0;
+
+        const int r = readIndex.load (std::memory_order_relaxed);
+        readIndex.store ((r + n) % capacity, std::memory_order_release);
+        slips.fetch_add (1, std::memory_order_relaxed);
+        return n;
+    }
+
+    /** Producer: write planar channel pointers. On overrun, discard oldest then retry. */
     int write (const float* const* src, int numSamples) noexcept
     {
         if (channels <= 0 || capacity <= 0 || src == nullptr || numSamples <= 0)
@@ -46,11 +64,16 @@ public:
         int written = 0;
         while (written < numSamples)
         {
-            const int space = getAvailableToWrite();
+            int space = getAvailableToWrite();
             if (space <= 0)
             {
+                // Slip: drop oldest quarter of capacity so capture keeps recent audio.
+                const int drop = juce::jmax (1, capacity / 4);
+                discard (drop);
                 overruns.fetch_add (1, std::memory_order_relaxed);
-                break;
+                space = getAvailableToWrite();
+                if (space <= 0)
+                    break;
             }
 
             const int w = writeIndex.load (std::memory_order_relaxed);
@@ -74,7 +97,7 @@ public:
         return written;
     }
 
-    /** Consumer (processBlock): fill planar destination; zeros on underrun. */
+    /** Consumer: read up to numSamples; zero-pad remainder. Counts soft underrun once if short. */
     void read (float* const* dst, int numSamples) noexcept
     {
         if (dst == nullptr || numSamples <= 0)
@@ -119,11 +142,13 @@ public:
 
     int getUnderruns() const noexcept { return underruns.load (std::memory_order_relaxed); }
     int getOverruns() const noexcept { return overruns.load (std::memory_order_relaxed); }
+    int getSlips() const noexcept { return slips.load (std::memory_order_relaxed); }
 
     void clearCounters() noexcept
     {
         underruns.store (0, std::memory_order_relaxed);
         overruns.store (0, std::memory_order_relaxed);
+        slips.store (0, std::memory_order_relaxed);
     }
 
 private:
@@ -134,4 +159,5 @@ private:
     std::atomic<int> readIndex { 0 };
     std::atomic<int> underruns { 0 };
     std::atomic<int> overruns { 0 };
+    std::atomic<int> slips { 0 };
 };

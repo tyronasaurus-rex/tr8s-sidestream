@@ -3,16 +3,16 @@
 TR8SSideStreamEditor::TR8SSideStreamEditor (TR8SSideStreamProcessor& p)
     : AudioProcessorEditor (&p), proc (p)
 {
-    setSize (560, 440);
+    setSize (620, 500);
 
     titleLabel.setText ("TR-8S SideStream", juce::dontSendNotification);
     titleLabel.setFont (juce::FontOptions (22.0f, juce::Font::bold));
     titleLabel.setJustificationType (juce::Justification::centredLeft);
     addAndMakeVisible (titleLabel);
 
-    hintLabel.setText ("Ableton keeps Model 12 ASIO. Pick “TR-8S (all stems)” to open IN 1–12.",
+    hintLabel.setText ("Use “TR-8S (all stems)”. Depth≈PDC; reopen after changing buffer settings.",
                        juce::dontSendNotification);
-    hintLabel.setFont (juce::FontOptions (13.0f));
+    hintLabel.setFont (juce::FontOptions (12.5f));
     hintLabel.setJustificationType (juce::Justification::centredLeft);
     addAndMakeVisible (hintLabel);
 
@@ -22,7 +22,30 @@ TR8SSideStreamEditor::TR8SSideStreamEditor (TR8SSideStreamProcessor& p)
     addAndMakeVisible (closeButton);
     addAndMakeVisible (statusLabel);
     statusLabel.setJustificationType (juce::Justification::topLeft);
-    statusLabel.setFont (juce::FontOptions (12.5f));
+    statusLabel.setFont (juce::FontOptions (12.0f));
+
+    wasapiLabel.setText ("WASAPI buf", juce::dontSendNotification);
+    wasapiLabel.attachToComponent (&wasapiBufBox, true);
+    addAndMakeVisible (wasapiLabel);
+    addAndMakeVisible (wasapiBufBox);
+    wasapiBufBox.addItem ("256", 256);
+    wasapiBufBox.addItem ("512", 512);
+    wasapiBufBox.addItem ("1024", 1024);
+    wasapiBufBox.setSelectedId (proc.getCapture().getWasapiBufferSize(), juce::dontSendNotification);
+    if (wasapiBufBox.getSelectedId() == 0)
+        wasapiBufBox.setSelectedId (512, juce::dontSendNotification);
+
+    latencyLabel.setText ("Depth ms", juce::dontSendNotification);
+    latencyLabel.attachToComponent (&latencySlider, true);
+    addAndMakeVisible (latencyLabel);
+    addAndMakeVisible (latencySlider);
+    latencySlider.setRange (WasapiCapture::kMinLatencyMs, WasapiCapture::kMaxLatencyMs, 1.0);
+    latencySlider.setValue (proc.getCapture().getLatencyMs(), juce::dontSendNotification);
+    latencySlider.setTextBoxStyle (juce::Slider::TextBoxLeft, false, 44, 22);
+    latencySlider.setSliderStyle (juce::Slider::LinearHorizontal);
+
+    latencySlider.onValueChange = [this] { applyBufferSettingsFromUi(); };
+    wasapiBufBox.onChange = [this] { applyBufferSettingsFromUi(); };
 
     refreshButton.onClick = [this]
     {
@@ -47,16 +70,14 @@ TR8SSideStreamEditor::TR8SSideStreamEditor (TR8SSideStreamProcessor& p)
 
     refreshDeviceCombo();
 
-    // Prefer aggregate, then remembered preference.
     bool selected = false;
     if (proc.getPreferredDevice().isNotEmpty())
     {
         for (int i = 0; i < deviceBox.getNumItems(); ++i)
         {
-            const auto text = deviceBox.getItemText (i);
-            if (text.startsWith (proc.getPreferredDevice())
+            if (deviceBox.getItemText (i).startsWith (proc.getPreferredDevice())
                 || (proc.getPreferredDevice() == WasapiCapture::kAggregateName
-                    && text.startsWith (WasapiCapture::kAggregateName)))
+                    && deviceBox.getItemText (i).startsWith (WasapiCapture::kAggregateName)))
             {
                 deviceBox.setSelectedItemIndex (i, juce::dontSendNotification);
                 selected = true;
@@ -72,7 +93,6 @@ TR8SSideStreamEditor::TR8SSideStreamEditor (TR8SSideStreamProcessor& p)
             if (deviceBox.getItemText (i).startsWith (WasapiCapture::kAggregateName))
             {
                 deviceBox.setSelectedItemIndex (i, juce::dontSendNotification);
-                selected = true;
                 break;
             }
         }
@@ -88,10 +108,17 @@ TR8SSideStreamEditor::~TR8SSideStreamEditor()
     stopTimer();
 }
 
+void TR8SSideStreamEditor::applyBufferSettingsFromUi()
+{
+    proc.getCapture().setLatencyMs ((int) latencySlider.getValue());
+    const int id = wasapiBufBox.getSelectedId();
+    if (id > 0)
+        proc.getCapture().setWasapiBufferSize (id);
+}
+
 void TR8SSideStreamEditor::paint (juce::Graphics& g)
 {
     g.fillAll (juce::Colour (0xff1a1d21));
-
     g.setColour (juce::Colour (0xff2a3038));
     g.fillRoundedRectangle (getLocalBounds().reduced (10).toFloat(), 8.0f);
 
@@ -103,11 +130,8 @@ void TR8SSideStreamEditor::paint (juce::Graphics& g)
 
         const float level = juce::jlimit (0.0f, 1.0f, meterLevels[(size_t) i]);
         auto fill = area;
-        const int h = (int) std::round (level * (float) area.getHeight());
-        fill = fill.removeFromBottom (h);
-
-        g.setColour (level > 0.85f ? juce::Colours::orangered
-                                   : juce::Colour (0xff3dd68c));
+        fill = fill.removeFromBottom ((int) std::round (level * (float) area.getHeight()));
+        g.setColour (level > 0.85f ? juce::Colours::orangered : juce::Colour (0xff3dd68c));
         g.fillRect (fill);
 
         g.setColour (juce::Colours::white.withAlpha (0.85f));
@@ -121,10 +145,10 @@ void TR8SSideStreamEditor::paint (juce::Graphics& g)
 void TR8SSideStreamEditor::resized()
 {
     auto r = getLocalBounds().reduced (20);
-    titleLabel.setBounds (r.removeFromTop (28));
+    titleLabel.setBounds (r.removeFromTop (26));
     r.removeFromTop (4);
-    hintLabel.setBounds (r.removeFromTop (20));
-    r.removeFromTop (12);
+    hintLabel.setBounds (r.removeFromTop (18));
+    r.removeFromTop (10);
 
     auto row = r.removeFromTop (28);
     deviceBox.setBounds (row.removeFromLeft (row.getWidth() - 260));
@@ -136,16 +160,21 @@ void TR8SSideStreamEditor::resized()
     closeButton.setBounds (row.removeFromLeft (70));
 
     r.removeFromTop (10);
-    statusLabel.setBounds (r.removeFromTop (88));
+    auto settings = r.removeFromTop (28);
+    settings.removeFromLeft (72);
+    wasapiBufBox.setBounds (settings.removeFromLeft (90));
+    settings.removeFromLeft (80);
+    latencySlider.setBounds (settings);
+
+    r.removeFromTop (10);
+    statusLabel.setBounds (r.removeFromTop (100));
     r.removeFromTop (8);
 
     auto meters = r.removeFromTop (180);
     const int gap = 6;
     const int w = (meters.getWidth() - gap * (kMeters - 1)) / kMeters;
     for (int i = 0; i < kMeters; ++i)
-    {
         meterBounds[(size_t) i] = { meters.getX() + i * (w + gap), meters.getY(), w, meters.getHeight() - 18 };
-    }
 }
 
 void TR8SSideStreamEditor::timerCallback()
@@ -153,7 +182,6 @@ void TR8SSideStreamEditor::timerCallback()
     auto& cap = proc.getCapture();
     for (int i = 0; i < kMeters; ++i)
         meterLevels[(size_t) i] = cap.getPeak (i);
-
     cap.decayPeaks (0.85f);
     updateStatusLabel();
     repaint();
@@ -172,16 +200,11 @@ void TR8SSideStreamEditor::refreshDeviceCombo()
     {
         const auto& d = devices.getReference (i);
         juce::String label = d.name;
-        if (d.isAggregate)
-            label += "  [12 mono from IN 1-2…11-12]";
-        else
-            label += "  [" + d.typeName + "]";
-
+        label += d.isAggregate ? "  [12 mono from IN 1-2…11-12]"
+                              : ("  [" + d.typeName + "]");
         deviceBox.addItem (label, id);
-
         if (d.isAggregate)
             aggregateIndex = i;
-
         ++id;
     }
 
@@ -203,16 +226,15 @@ void TR8SSideStreamEditor::refreshDeviceCombo()
 
 void TR8SSideStreamEditor::openSelectedDevice()
 {
+    applyBufferSettingsFromUi();
+
     auto name = deviceBox.getText();
     if (name.isEmpty())
         return;
 
-    // Strip display suffix "  […]".
     const int bracket = name.lastIndexOf ("  [");
     if (bracket > 0)
         name = name.substring (0, bracket);
-
-    // Persist aggregate under its canonical name.
     if (name.startsWith (WasapiCapture::kAggregateName))
         name = WasapiCapture::kAggregateName;
 
@@ -222,7 +244,6 @@ void TR8SSideStreamEditor::openSelectedDevice()
         statusLabel.setText ("Open: " + err, juce::dontSendNotification);
     else
         updateStatusLabel();
-
     repaint();
 }
 
@@ -237,23 +258,27 @@ void TR8SSideStreamEditor::updateStatusLabel()
         if (cap.isAggregateOpen())
             s << "Pairs: " << cap.getOpenPairSummary() << "\n";
 
-        s << "Capture ch: " << cap.getCaptureChannelCount()
-          << "  |  rate: " << juce::String (cap.getCaptureSampleRate(), 1) << " Hz"
-          << "  |  buf: " << cap.getCaptureBufferSize()
-          << "\nHost rate: " << juce::String (proc.getHostSampleRate(), 1) << " Hz"
-          << "  |  PDC: " << cap.getReportedLatencySamples() << " smp"
-          << "\nRing avail: " << cap.getAvailableToRead()
-          << "  underruns: " << cap.getUnderruns()
-          << "  overruns: " << cap.getOverruns();
+        s << "ch " << cap.getCaptureChannelCount()
+          << " | rate " << juce::String (cap.getCaptureSampleRate(), 1) << " Hz"
+          << " | WASAPI " << cap.getCaptureBufferSize() << " (req " << cap.getWasapiBufferSize() << ")"
+          << " | depth " << cap.getLatencyMs() << " ms\n"
+          << "Host " << juce::String (proc.getHostSampleRate(), 1) << " Hz / block "
+          << proc.getHostBlockSize()
+          << " | PDC " << cap.getReportedLatencySamples() << " smp"
+          << " | primed " << (cap.isPrimed() ? "yes" : "pre-roll…") << "\n"
+          << "FIFO " << cap.getAvailableToRead() << "/" << cap.getTargetFillSamples()
+          << " | underrun " << cap.getUnderruns()
+          << " | overrun " << cap.getOverruns()
+          << " | slip " << cap.getSlips();
 
         if (std::abs (cap.getCaptureSampleRate() - proc.getHostSampleRate()) > 1.0)
-            s << "\nWARNING: sample rates differ — match Roland panel to Live.";
+            s << "\nWARNING: sample rates differ — set Roland panel = Live.";
     }
     else
     {
-        s << "Closed. Select “TR-8S (all stems)” to open IN 1-2…11-12 (MIX left off).\n"
-          << "Individual stereo endpoints remain available for testing.\n"
-          << "Devices listed: " << proc.getCapture().getDevices().size();
+        s << "Closed. Select TR-8S (all stems). Set depth (default 100ms) & WASAPI buf (512),\n"
+          << "then Open. Ableton buffer 256–512 @ 48 kHz is a good starting point.\n"
+          << "Devices: " << proc.getCapture().getDevices().size();
         if (cap.getLastError().isNotEmpty())
             s << "\nLast error: " << cap.getLastError();
     }

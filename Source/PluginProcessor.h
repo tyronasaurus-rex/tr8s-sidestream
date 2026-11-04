@@ -23,7 +23,6 @@ public:
     bool hasEditor() const override { return true; }
 
     const juce::String getName() const override { return JucePlugin_Name; }
-    // Must match NEEDS_MIDI_INPUT — Ableton requires an event bus on Instruments.
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return false; }
     bool isMidiEffect() const override { return false; }
@@ -47,9 +46,6 @@ public:
     double getHostSampleRate() const noexcept { return hostSampleRate; }
     int getHostBlockSize() const noexcept { return hostBlockSize; }
 
-    /** Soft-start ring: wait until this many samples buffered before reading. */
-    int getPrimingTarget() const noexcept;
-
 private:
     static juce::AudioProcessor::BusesProperties makeBuses();
 
@@ -57,7 +53,6 @@ private:
     juce::String preferredDevice;
     double hostSampleRate = 48000.0;
     int hostBlockSize = 512;
-    bool primed = false;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (TR8SSideStreamProcessor)
 };

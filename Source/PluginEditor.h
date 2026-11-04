@@ -2,6 +2,7 @@
 
 #include <JuceHeader.h>
 #include "PluginProcessor.h"
+#include <array>
 
 class TR8SSideStreamEditor final : public juce::AudioProcessorEditor,
                                    private juce::Timer
@@ -18,10 +19,15 @@ private:
     void refreshDeviceCombo();
     void updateStatusLabel();
     void openSelectedDevice();
+    void applyBufferSettingsFromUi();
 
     TR8SSideStreamProcessor& proc;
 
     juce::ComboBox deviceBox;
+    juce::ComboBox wasapiBufBox;
+    juce::Slider latencySlider;
+    juce::Label latencyLabel;
+    juce::Label wasapiLabel;
     juce::TextButton refreshButton { "Refresh" };
     juce::TextButton openButton { "Open" };
     juce::TextButton closeButton { "Close" };
