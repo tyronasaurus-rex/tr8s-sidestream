@@ -3,14 +3,14 @@
 TR8SSideStreamEditor::TR8SSideStreamEditor (TR8SSideStreamProcessor& p)
     : AudioProcessorEditor (&p), proc (p)
 {
-    setSize (560, 420);
+    setSize (560, 440);
 
     titleLabel.setText ("TR-8S SideStream", juce::dontSendNotification);
     titleLabel.setFont (juce::FontOptions (22.0f, juce::Font::bold));
     titleLabel.setJustificationType (juce::Justification::centredLeft);
     addAndMakeVisible (titleLabel);
 
-    hintLabel.setText ("Ableton keeps Model 12 ASIO. This plugin opens TR-8S via WASAPI.",
+    hintLabel.setText ("Ableton keeps Model 12 ASIO. Pick “TR-8S (all stems)” to open IN 1–12.",
                        juce::dontSendNotification);
     hintLabel.setFont (juce::FontOptions (13.0f));
     hintLabel.setJustificationType (juce::Justification::centredLeft);
@@ -22,7 +22,7 @@ TR8SSideStreamEditor::TR8SSideStreamEditor (TR8SSideStreamProcessor& p)
     addAndMakeVisible (closeButton);
     addAndMakeVisible (statusLabel);
     statusLabel.setJustificationType (juce::Justification::topLeft);
-    statusLabel.setFont (juce::FontOptions (13.0f));
+    statusLabel.setFont (juce::FontOptions (12.5f));
 
     refreshButton.onClick = [this]
     {
@@ -47,13 +47,32 @@ TR8SSideStreamEditor::TR8SSideStreamEditor (TR8SSideStreamProcessor& p)
 
     refreshDeviceCombo();
 
+    // Prefer aggregate, then remembered preference.
+    bool selected = false;
     if (proc.getPreferredDevice().isNotEmpty())
     {
         for (int i = 0; i < deviceBox.getNumItems(); ++i)
         {
-            if (deviceBox.getItemText (i) == proc.getPreferredDevice())
+            const auto text = deviceBox.getItemText (i);
+            if (text.startsWith (proc.getPreferredDevice())
+                || (proc.getPreferredDevice() == WasapiCapture::kAggregateName
+                    && text.startsWith (WasapiCapture::kAggregateName)))
             {
                 deviceBox.setSelectedItemIndex (i, juce::dontSendNotification);
+                selected = true;
+                break;
+            }
+        }
+    }
+
+    if (! selected)
+    {
+        for (int i = 0; i < deviceBox.getNumItems(); ++i)
+        {
+            if (deviceBox.getItemText (i).startsWith (WasapiCapture::kAggregateName))
+            {
+                deviceBox.setSelectedItemIndex (i, juce::dontSendNotification);
+                selected = true;
                 break;
             }
         }
@@ -117,7 +136,7 @@ void TR8SSideStreamEditor::resized()
     closeButton.setBounds (row.removeFromLeft (70));
 
     r.removeFromTop (10);
-    statusLabel.setBounds (r.removeFromTop (70));
+    statusLabel.setBounds (r.removeFromTop (88));
     r.removeFromTop (8);
 
     auto meters = r.removeFromTop (180);
@@ -147,20 +166,21 @@ void TR8SSideStreamEditor::refreshDeviceCombo()
 
     const auto devices = proc.getCapture().getDevices();
     int id = 1;
-    int preferIndex = -1;
+    int aggregateIndex = -1;
 
     for (int i = 0; i < devices.size(); ++i)
     {
         const auto& d = devices.getReference (i);
-        // Show type suffix so shared vs exclusive is visible; openDevice matches on prefix name.
-        deviceBox.addItem (d.name + "  [" + d.typeName + "]", id);
+        juce::String label = d.name;
+        if (d.isAggregate)
+            label += "  [12 mono from IN 1-2…11-12]";
+        else
+            label += "  [" + d.typeName + "]";
 
-        if (d.name.containsIgnoreCase ("TR-8S") || d.name.containsIgnoreCase ("TR8S"))
-        {
-            const bool multi = d.name.containsIgnoreCase ("MULTI");
-            if (preferIndex < 0 || multi)
-                preferIndex = i;
-        }
+        deviceBox.addItem (label, id);
+
+        if (d.isAggregate)
+            aggregateIndex = i;
 
         ++id;
     }
@@ -175,18 +195,8 @@ void TR8SSideStreamEditor::refreshDeviceCombo()
             }
     }
 
-    if (proc.getPreferredDevice().isNotEmpty())
-    {
-        for (int i = 0; i < deviceBox.getNumItems(); ++i)
-            if (deviceBox.getItemText (i) == proc.getPreferredDevice())
-            {
-                deviceBox.setSelectedItemIndex (i, juce::dontSendNotification);
-                return;
-            }
-    }
-
-    if (preferIndex >= 0)
-        deviceBox.setSelectedItemIndex (preferIndex, juce::dontSendNotification);
+    if (aggregateIndex >= 0)
+        deviceBox.setSelectedItemIndex (aggregateIndex, juce::dontSendNotification);
     else if (deviceBox.getNumItems() > 0)
         deviceBox.setSelectedItemIndex (0, juce::dontSendNotification);
 }
@@ -197,19 +207,22 @@ void TR8SSideStreamEditor::openSelectedDevice()
     if (name.isEmpty())
         return;
 
-    // Strip "  [Windows Audio…]" suffix added for display.
+    // Strip display suffix "  […]".
     const int bracket = name.lastIndexOf ("  [");
     if (bracket > 0)
         name = name.substring (0, bracket);
 
+    // Persist aggregate under its canonical name.
+    if (name.startsWith (WasapiCapture::kAggregateName))
+        name = WasapiCapture::kAggregateName;
+
     proc.setPreferredDevice (name);
     const auto err = proc.getCapture().openDevice (name, proc.getHostSampleRate(), proc.getHostBlockSize());
     if (err.isNotEmpty())
-        statusLabel.setText ("Open failed: " + err, juce::dontSendNotification);
+        statusLabel.setText ("Open: " + err, juce::dontSendNotification);
     else
         updateStatusLabel();
 
-    // Persist preferred device into host state on next getStateInformation.
     repaint();
 }
 
@@ -220,23 +233,26 @@ void TR8SSideStreamEditor::updateStatusLabel()
 
     if (cap.isOpen())
     {
-        s << "OPEN: " << cap.getCurrentDeviceName() << "\n"
-          << "Capture ch: " << cap.getCaptureChannelCount()
+        s << "OPEN: " << cap.getCurrentDeviceName() << "\n";
+        if (cap.isAggregateOpen())
+            s << "Pairs: " << cap.getOpenPairSummary() << "\n";
+
+        s << "Capture ch: " << cap.getCaptureChannelCount()
           << "  |  rate: " << juce::String (cap.getCaptureSampleRate(), 1) << " Hz"
           << "  |  buf: " << cap.getCaptureBufferSize()
           << "\nHost rate: " << juce::String (proc.getHostSampleRate(), 1) << " Hz"
-          << "  |  PDC latency: " << cap.getReportedLatencySamples() << " samples"
-          << "\nRing avail: " << cap.getRing().getAvailableToRead()
-          << "  underruns: " << cap.getRing().getUnderruns()
-          << "  overruns: " << cap.getRing().getOverruns();
+          << "  |  PDC: " << cap.getReportedLatencySamples() << " smp"
+          << "\nRing avail: " << cap.getAvailableToRead()
+          << "  underruns: " << cap.getUnderruns()
+          << "  overruns: " << cap.getOverruns();
 
         if (std::abs (cap.getCaptureSampleRate() - proc.getHostSampleRate()) > 1.0)
-            s << "\nWARNING: sample rates differ — drift stub, match Roland panel to Live.";
+            s << "\nWARNING: sample rates differ — match Roland panel to Live.";
     }
     else
     {
-        s << "Closed. Select a TR-8S WASAPI input (prefer MULTI / 12-ch if listed) and Open.\n"
-          << "Stereo endpoints (IN 1-2 … IN 11-12) only yield 2 channels each.\n"
+        s << "Closed. Select “TR-8S (all stems)” to open IN 1-2…11-12 (MIX left off).\n"
+          << "Individual stereo endpoints remain available for testing.\n"
           << "Devices listed: " << proc.getCapture().getDevices().size();
         if (cap.getLastError().isNotEmpty())
             s << "\nLast error: " << cap.getLastError();

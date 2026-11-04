@@ -89,7 +89,7 @@ void TR8SSideStreamProcessor::processBlock (juce::AudioBuffer<float>& buffer, ju
     // Spike: 1:1 sample copy — match Live and Roland panel sample rates.
     if (! primed)
     {
-        if (capture.getRing().getAvailableToRead() < getPrimingTarget())
+        if (capture.getAvailableToRead() < getPrimingTarget())
             return;
         primed = true;
     }
@@ -101,9 +101,7 @@ void TR8SSideStreamProcessor::processBlock (juce::AudioBuffer<float>& buffer, ju
     for (int i = 0; i < kNumStems; ++i)
         chPtrs[i] = temp.getWritePointer (i);
 
-    capture.getRing().read (chPtrs, numSamples);
-
-    const int captureCh = juce::jmin (kNumStems, capture.getCaptureChannelCount());
+    capture.readStems (chPtrs, numSamples);
 
     for (int bus = 0; bus < kNumStems; ++bus)
     {
@@ -112,11 +110,8 @@ void TR8SSideStreamProcessor::processBlock (juce::AudioBuffer<float>& buffer, ju
             continue;
 
         auto busBuffer = getBusBuffer (buffer, false, bus);
-        if (bus < captureCh)
-        {
-            for (int c = 0; c < busBuffer.getNumChannels(); ++c)
-                busBuffer.copyFrom (c, 0, temp, bus, 0, numSamples);
-        }
+        for (int c = 0; c < busBuffer.getNumChannels(); ++c)
+            busBuffer.copyFrom (c, 0, temp, bus, 0, numSamples);
     }
 
     setLatencySamples (capture.getReportedLatencySamples());
