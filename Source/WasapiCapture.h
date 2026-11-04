@@ -16,8 +16,9 @@ public:
     static constexpr const char* kSharedWasapi = "Windows Audio";
     static constexpr const char* kExclusiveWasapi = "Windows Audio (Exclusive Mode)";
 
-    static constexpr int kDefaultLatencyMs = 120;
-    static constexpr int kDefaultWasapiBuffer = 512;
+    static constexpr int kDefaultLatencyMs = 150;
+    static constexpr int kDefaultWasapiBuffer = 1024;
+    static constexpr const char* kAggregateExclusiveName = "TR-8S (all stems, exclusive)";
     static constexpr int kMinLatencyMs = 40;
     static constexpr int kMaxLatencyMs = 250;
 
@@ -95,7 +96,7 @@ private:
     struct PairEndpoint;
 
     void notifyStatus();
-    juce::String openAggregate (double preferredSampleRate, int preferredBufferSize);
+    juce::String openAggregate (double preferredSampleRate, int preferredBufferSize, bool exclusive);
     juce::String openSingle (const juce::String& deviceName,
                              const juce::String& typeName,
                              double preferredSampleRate,

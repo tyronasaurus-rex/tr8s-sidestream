@@ -1,34 +1,39 @@
 # TR-8S SideStream (spike)
 
-Ableton keeps **Model 12 ASIO**; plugin captures **TR-8S** WASAPI stems as **12 mono outs**.
+**Version:** 0.4.1
 
-**Version:** 0.4.0 — adaptive fractional SRC toward FIFO midpoint (multi-clock)
+## Honest architecture note
 
-## Open / buffers
+Opening **six independent WASAPI capture clients** inside a Live-hosted VST is fragile (callback jitter, shared-mode quantum, dual clocks). 0.4.1 fixes real bugs that caused **immediate** underrun ratchets; long-term stability may still need exclusive mode, larger periods, or an out-of-process engine / different I/O strategy.
 
-| Setting | Start here |
-| --- | --- |
-| Live + Roland panel | **48 kHz** |
-| Ableton buffer | **512** (1024 if CPU/WASAPI still rough) |
-| Plugin **WASAPI buf** | **512** (re-Open after change) |
-| Plugin **Depth ms** | **120** (100–150 typical; raises midpoint waterline) |
+## Critical fixes in 0.4.1
 
-1. MIDI track → **TR-8S SideStream** → **`TR-8S (all stems)`** → Open  
-2. Wait for **`primed yes`**  
-3. Status `SRC ≈ 1.00x` and pair line like `IN 1-2=1.001*` (`*` = master). `x` = dead callback.
+1. **SPSC bug**: capture thread was `discard()`-ing (moving `readIndex`) on overrun → raced `process()` and corrupted FIFO.
+2. **SRC bug**: `readResampled` used all-or-nothing “need N samples or underrun+read zero”; one late pair underran **every block**. Now ratio is clamped to available so reads always progress when `fifo>2`.
+3. Diagnostics: per-pair `fifo=`, `cb/s=`, `wr=` (samples written/sec).
+4. Aggregate option: **`TR-8S (all stems, exclusive)`**.
+5. Defaults: Depth **150 ms**, WASAPI **1024**.
 
-Install: `C:\Program Files\Common Files\VST3\TR-8S SideStream.vst3` (close Live first).
+## What Tyron should set / look for
 
-## What 0.4.0 changed
+| | |
+|---|---|
+| Live + Roland | 48 kHz |
+| Ableton buffer | **1024** (or 512 if CPU OK) |
+| Plugin WASAPI | **1024** |
+| Plugin Depth | **150** |
+| Device | try shared aggregate first; if `cb/s` uneven, use **exclusive** |
 
-- **Adaptive SRC**: each pair linear-resamples with a PI controller that holds FIFO near **~60% of Depth** (not just slip when empty).
-- **Master pair** (prefer IN 1-2): hosts the reference ratio; slaves blend 50% toward master so all track one clock vs Live.
-- **Dead-callback watchdog**: if a pair stops writing (~150 ms), it is muted (`x`) and no longer ratchets underruns.
-- Pre-roll still fills to midpoint before audio; coarse slip only for emergency overflow.
+After Open, status should show all six pairs with **`cb/s` roughly similar and `>0`**, `wr≈48000`, `fifo` near mid — not stuck at 0 and not `DEAD`.
 
-## Build
+If any pair shows `cb/s=0` / `DEAD` while others run → that endpoint isn’t calling back (driver/scheduling); architecture rethink.
+
+## Build / install
+
+Close Live, then:
 
 ```bat
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release --target TR8SSideStream_VST3
 ```
+
+→ `C:\Program Files\Common Files\VST3\TR-8S SideStream.vst3`

@@ -4,7 +4,8 @@
 #include <atomic>
 #include <vector>
 
-/** Lock-free single-producer / single-consumer planar float ring buffer. */
+/** Lock-free single-producer / single-consumer planar float ring buffer.
+    Producer may only advance writeIndex; consumer only readIndex. */
 class PlanarRingBuffer
 {
 public:
@@ -38,6 +39,7 @@ public:
         return capacity - 1 - getAvailableToRead();
     }
 
+    /** Consumer only. */
     int discard (int numSamples) noexcept
     {
         if (numSamples <= 0 || capacity <= 0)
@@ -54,6 +56,7 @@ public:
         return n;
     }
 
+    /** Producer: never touches readIndex (SPSC-safe). On full ring, drop newest. */
     int write (const float* const* src, int numSamples) noexcept
     {
         if (channels <= 0 || capacity <= 0 || src == nullptr || numSamples <= 0)
@@ -62,15 +65,12 @@ public:
         int written = 0;
         while (written < numSamples)
         {
-            int space = getAvailableToWrite();
+            const int space = getAvailableToWrite();
             if (space <= 0)
             {
-                const int drop = juce::jmax (1, capacity / 4);
-                discard (drop);
+                // Do NOT discard/readIndex from the producer — that races the audio thread.
                 overruns.fetch_add (1, std::memory_order_relaxed);
-                space = getAvailableToWrite();
-                if (space <= 0)
-                    break;
+                break; // drop remaining newest samples
             }
 
             const int w = writeIndex.load (std::memory_order_relaxed);
@@ -129,23 +129,19 @@ public:
     }
 
     /**
-     * Linear-interpolation SRC read into numOut host samples.
-     * ratio = capture samples consumed per host sample (1.0 = locked).
-     * fracPhase holds [0,1) residual between calls.
-     * Needs ~numOut*ratio+2 samples available; otherwise soft-underruns.
+     * Linear SRC. Always makes progress when avail > 2: clamps ratio so we never
+     * request more than available (avoids all-or-nothing underrun every block).
      */
     void readResampled (float* const* dst, int numOut, double ratio, double& fracPhase) noexcept
     {
         if (dst == nullptr || numOut <= 0 || channels <= 0 || capacity <= 0)
             return;
 
-        ratio = juce::jlimit (0.90, 1.10, ratio);
         if (fracPhase < 0.0 || fracPhase >= 1.0)
             fracPhase = 0.0;
 
-        const int avail = getAvailableToRead();
-        const double need = (double) numOut * ratio + 2.0;
-        if (avail < (int) std::ceil (need))
+        int avail = getAvailableToRead();
+        if (avail <= 2)
         {
             underruns.fetch_add (1, std::memory_order_relaxed);
             for (int ch = 0; ch < channels; ++ch)
@@ -154,9 +150,21 @@ public:
             return;
         }
 
+        // Leave 1 sample margin for lerp endpoint.
+        const double maxRatio = ((double) avail - 2.0 - fracPhase) / (double) numOut;
+        if (maxRatio <= 0.0)
+        {
+            underruns.fetch_add (1, std::memory_order_relaxed);
+            for (int ch = 0; ch < channels; ++ch)
+                if (dst[ch] != nullptr)
+                    juce::FloatVectorOperations::clear (dst[ch], numOut);
+            return;
+        }
+
+        ratio = juce::jlimit (0.85, juce::jmin (1.15, maxRatio), ratio);
+
         const int r0 = readIndex.load (std::memory_order_relaxed);
-        double pos = fracPhase; // offset from r0 in capture samples
-        double maxPos = 0.0;
+        double pos = fracPhase;
 
         for (int i = 0; i < numOut; ++i)
         {
@@ -174,11 +182,10 @@ public:
             }
 
             pos += ratio;
-            maxPos = pos;
         }
 
-        const int advance = (int) maxPos; // floor
-        fracPhase = maxPos - (double) advance;
+        const int advance = (int) pos;
+        fracPhase = pos - (double) advance;
         readIndex.store ((r0 + advance) % capacity, std::memory_order_release);
     }
 

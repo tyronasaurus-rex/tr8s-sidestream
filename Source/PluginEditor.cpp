@@ -3,7 +3,7 @@
 TR8SSideStreamEditor::TR8SSideStreamEditor (TR8SSideStreamProcessor& p)
     : AudioProcessorEditor (&p), proc (p)
 {
-    setSize (620, 500);
+    setSize (720, 560);
 
     titleLabel.setText ("TR-8S SideStream", juce::dontSendNotification);
     titleLabel.setFont (juce::FontOptions (22.0f, juce::Font::bold));
@@ -31,9 +31,10 @@ TR8SSideStreamEditor::TR8SSideStreamEditor (TR8SSideStreamProcessor& p)
     wasapiBufBox.addItem ("256", 256);
     wasapiBufBox.addItem ("512", 512);
     wasapiBufBox.addItem ("1024", 1024);
+    wasapiBufBox.addItem ("2048", 2048);
     wasapiBufBox.setSelectedId (proc.getCapture().getWasapiBufferSize(), juce::dontSendNotification);
     if (wasapiBufBox.getSelectedId() == 0)
-        wasapiBufBox.setSelectedId (512, juce::dontSendNotification);
+        wasapiBufBox.setSelectedId (1024, juce::dontSendNotification);
 
     latencyLabel.setText ("Depth ms", juce::dontSendNotification);
     latencyLabel.attachToComponent (&latencySlider, true);
@@ -167,10 +168,10 @@ void TR8SSideStreamEditor::resized()
     latencySlider.setBounds (settings);
 
     r.removeFromTop (10);
-    statusLabel.setBounds (r.removeFromTop (100));
+    statusLabel.setBounds (r.removeFromTop (140));
     r.removeFromTop (8);
 
-    auto meters = r.removeFromTop (180);
+    auto meters = r.removeFromTop (160);
     const int gap = 6;
     const int w = (meters.getWidth() - gap * (kMeters - 1)) / kMeters;
     for (int i = 0; i < kMeters; ++i)
@@ -235,7 +236,9 @@ void TR8SSideStreamEditor::openSelectedDevice()
     const int bracket = name.lastIndexOf ("  [");
     if (bracket > 0)
         name = name.substring (0, bracket);
-    if (name.startsWith (WasapiCapture::kAggregateName))
+    if (name.startsWith (WasapiCapture::kAggregateExclusiveName))
+        name = WasapiCapture::kAggregateExclusiveName;
+    else if (name.startsWith (WasapiCapture::kAggregateName))
         name = WasapiCapture::kAggregateName;
 
     proc.setPreferredDevice (name);
@@ -272,15 +275,15 @@ void TR8SSideStreamEditor::updateStatusLabel()
           << " | underrun " << cap.getUnderruns()
           << " | overrun " << cap.getOverruns()
           << " | slip " << cap.getSlips() << "\n"
-          << "Pairs " << cap.getPairHealthSummary();
+          << cap.getPairHealthSummary();
 
         if (std::abs (cap.getCaptureSampleRate() - proc.getHostSampleRate()) > 1.0)
             s << "\nWARNING: sample rates differ — set Roland panel = Live.";
     }
     else
     {
-        s << "Closed. Select TR-8S (all stems). Set depth (default 100ms) & WASAPI buf (512),\n"
-          << "then Open. Ableton buffer 256–512 @ 48 kHz is a good starting point.\n"
+        s << "Closed. Prefer “TR-8S (all stems)” or “…exclusive”. Depth 150, WASAPI 1024.\n"
+          << "Ableton buffer 512–1024 @ 48 kHz. After Open, status must show cb/s>0 on all pairs.\n"
           << "Devices: " << proc.getCapture().getDevices().size();
         if (cap.getLastError().isNotEmpty())
             s << "\nLast error: " << cap.getLastError();

@@ -132,6 +132,9 @@ struct WasapiCapture::PairEndpoint final : private juce::AudioIODeviceCallback
         ring.clearCounters();
         resetAdaptive();
         lastWriteTicks.store (juce::Time::getHighResolutionTicks(), std::memory_order_relaxed);
+        callbackCount.store (0, std::memory_order_relaxed);
+        samplesWritten.store (0, std::memory_order_relaxed);
+        diagEpochTicks = juce::Time::getHighResolutionTicks();
         markedDead = false;
 
         manager.addAudioCallback (this);
@@ -165,7 +168,7 @@ struct WasapiCapture::PairEndpoint final : private juce::AudioIODeviceCallback
         return manager.getCurrentAudioDevice() != nullptr && activeChannels > 0;
     }
 
-    bool isCallbackAlive (double timeoutSec = 0.15) const noexcept
+    bool isCallbackAlive (double timeoutSec = 0.50) const noexcept
     {
         if (! isOpen())
             return false;
@@ -210,8 +213,10 @@ struct WasapiCapture::PairEndpoint final : private juce::AudioIODeviceCallback
             return;
 
         lastWriteTicks.store (juce::Time::getHighResolutionTicks(), std::memory_order_relaxed);
+        callbackCount.fetch_add (1, std::memory_order_relaxed);
+        samplesWritten.fetch_add ((uint64_t) numSamples, std::memory_order_relaxed);
         if (markedDead)
-            markedDead = false; // resurrect if callback returns
+            markedDead = false;
 
         const float* src[2] = {};
         const int n = juce::jmin (2, numInputChannels);
@@ -268,6 +273,9 @@ struct WasapiCapture::PairEndpoint final : private juce::AudioIODeviceCallback
     int latencyIn = 0;
 
     std::atomic<juce::int64> lastWriteTicks { 0 };
+    std::atomic<uint64_t> callbackCount { 0 };
+    std::atomic<uint64_t> samplesWritten { 0 };
+    juce::int64 diagEpochTicks = 0;
     double fracPhase = 0.0;
     double ratio = 1.0;
     double integ = 0.0;
@@ -303,7 +311,7 @@ int WasapiCapture::pairIndexFromDeviceName (const juce::String& name)
 int WasapiCapture::snapWasapiBuffer (int samples) noexcept
 {
     static constexpr int choices[] = { 128, 256, 512, 1024, 2048 };
-    int best = 512;
+    int best = 1024;
     int bestDist = INT_MAX;
     for (int c : choices)
     {
@@ -439,8 +447,29 @@ void WasapiCapture::refreshDeviceList()
         found.add (agg);
     }
 
-    // Physical devices: prefer listing shared first, skip exclusive duplicates of TR-8S
-    // pairs in the UI by putting shared ahead; still list exclusive for power users.
+    int exclPairCount = 0;
+    bool haveExcl[kNumPairs] = {};
+    for (const auto& d : physical)
+    {
+        if (d.typeName != kExclusiveWasapi)
+            continue;
+        const int idx = pairIndexFromDeviceName (d.name);
+        if (idx >= 0 && ! haveExcl[idx])
+        {
+            haveExcl[idx] = true;
+            ++exclPairCount;
+        }
+    }
+    if (exclPairCount == kNumPairs)
+    {
+        DeviceInfo agg;
+        agg.name = kAggregateExclusiveName;
+        agg.typeName = kExclusiveWasapi;
+        agg.inputChannels = kMaxChannels;
+        agg.isAggregate = true;
+        found.add (agg);
+    }
+
     for (const auto& d : physical)
         found.add (d);
 
@@ -458,12 +487,11 @@ juce::Array<WasapiCapture::DeviceInfo> WasapiCapture::getDevices() const
     return devices;
 }
 
-juce::String WasapiCapture::openAggregate (double preferredSampleRate, int preferredBufferSize)
+juce::String WasapiCapture::openAggregate (double preferredSampleRate, int preferredBufferSize, bool exclusive)
 {
     closeDevice();
     lastError.clear();
 
-    // Refresh so we use the same DeviceInfo name+typeName the combo lists for single opens.
     refreshDeviceList();
 
     struct FoundPair
@@ -474,15 +502,17 @@ juce::String WasapiCapture::openAggregate (double preferredSampleRate, int prefe
 
     FoundPair found[kNumPairs];
     int foundCount = 0;
+    const juce::String primaryType = exclusive ? juce::String (kExclusiveWasapi)
+                                               : juce::String (kSharedWasapi);
+    const juce::String fallbackType = exclusive ? juce::String (kSharedWasapi)
+                                                : juce::String (kExclusiveWasapi);
 
     {
         const juce::ScopedLock sl (deviceListLock);
 
-        // Pass 1: shared Windows Audio (preferred). Pass 2: exclusive fallback.
         for (int pass = 0; pass < 2; ++pass)
         {
-            const juce::String wantType = (pass == 0 ? juce::String (kSharedWasapi)
-                                                     : juce::String (kExclusiveWasapi));
+            const juce::String wantType = (pass == 0 ? primaryType : fallbackType);
 
             for (const auto& d : devices)
             {
@@ -624,10 +654,16 @@ juce::String WasapiCapture::openDevice (const juce::String& deviceName,
 
     primed.store (false, std::memory_order_relaxed);
 
+    if (deviceName == kAggregateExclusiveName
+        || deviceName.startsWith (kAggregateExclusiveName))
+    {
+        return openAggregate (preferredSampleRate, preferredBufferSize, true);
+    }
+
     if (deviceName == kAggregateName
         || deviceName.startsWith (kAggregateName))
     {
-        return openAggregate (preferredSampleRate, preferredBufferSize);
+        return openAggregate (preferredSampleRate, preferredBufferSize, false);
     }
 
     juce::String typeForDevice = kSharedWasapi;
@@ -767,7 +803,7 @@ void WasapiCapture::readStems (float* const* dst, int numSamples) noexcept
         {
             if (p == nullptr || ! p->isOpen())
                 continue;
-            if (primed.load (std::memory_order_relaxed) && ! p->isCallbackAlive (0.15))
+            if (primed.load (std::memory_order_relaxed) && ! p->isCallbackAlive (0.50))
                 p->markedDead = true;
         }
     }
@@ -828,10 +864,10 @@ void WasapiCapture::readStems (float* const* dst, int numSamples) noexcept
     {
         float* pairDst[2] = { left, right };
 
-        if (! ep.isOpen() || ep.markedDead || ! ep.isCallbackAlive (0.20))
+        if (! ep.isOpen() || ep.markedDead || ! ep.isCallbackAlive (0.50))
         {
-            ep.markedDead = ep.isOpen(); // keep flag if still "open" but silent
-            return; // leave silence; do not underrun-count a dead callback
+            ep.markedDead = ep.isOpen();
+            return; // silence; do not underrun-count a dead callback
         }
 
         int avail = ep.ring.getAvailableToRead();
@@ -928,29 +964,41 @@ void WasapiCapture::clearXrunCounters() noexcept
 
 juce::String WasapiCapture::getPairHealthSummary() const
 {
+    auto pairDiag = [] (const PairEndpoint& p, bool isMaster) -> juce::String
+    {
+        const double elapsed = juce::jmax (0.05, juce::Time::highResolutionTicksToSeconds (
+            juce::Time::getHighResolutionTicks() - p.diagEpochTicks));
+        const double cbHz = (double) p.callbackCount.load (std::memory_order_relaxed) / elapsed;
+        const double wrRate = (double) p.samplesWritten.load (std::memory_order_relaxed) / elapsed;
+        juce::String s;
+        s << "fifo=" << p.ring.getAvailableToRead()
+          << " cb/s=" << juce::String (cbHz, 1)
+          << " wr=" << juce::String (wrRate, 0)
+          << " r=" << juce::String (p.ratio, 3);
+        if (p.markedDead || ! p.isCallbackAlive())
+            s << " DEAD";
+        if (isMaster)
+            s << "*";
+        return s;
+    };
+
     if (! aggregateOpen)
     {
-        if (single == nullptr)
+        if (single == nullptr || ! single->isOpen())
             return {};
-        return single->isHealthy() ? "OK" : "DEAD/stale";
+        return pairDiag (*single, true);
     }
 
     juce::StringArray parts;
     for (int i = 0; i < kNumPairs; ++i)
     {
         auto& p = pairs[(size_t) i];
-        juce::String s (pairLabel (i));
         if (p == nullptr || ! p->isOpen())
-            s << "!";
-        else if (p->markedDead || ! p->isCallbackAlive())
-            s << "x"; // dead callback
+            parts.add (juce::String (pairLabel (i)) + ":!");
         else
-            s << "=" << juce::String (p->ratio, 3);
-        if (i == masterPairIndex)
-            s << "*";
-        parts.add (s);
+            parts.add (juce::String (pairLabel (i)) + ":" + pairDiag (*p, i == masterPairIndex));
     }
-    return parts.joinIntoString (" ");
+    return parts.joinIntoString (" | ");
 }
 
 float WasapiCapture::getPeak (int channel) const noexcept
