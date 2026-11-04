@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(TR8SSideStream VERSION 0.1.0)
+project(TR8SSideStream VERSION 0.1.1)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -13,8 +13,11 @@ juce_add_plugin(TR8SSideStream
     COMPANY_WEBSITE "https://localhost"
     COMPANY_EMAIL ""
     BUNDLE_ID "com.tyron.tr8s-sidestream"
+    # Ableton requires Instrument-category VST3s to expose an event (MIDI) input
+    # bus or it fails with: "plugin has instrument category, but no valid event input bus".
+    # We ignore MIDI in processBlock; the bus exists so Live will load us on a MIDI track.
     IS_SYNTH TRUE
-    NEEDS_MIDI_INPUT FALSE
+    NEEDS_MIDI_INPUT TRUE
     NEEDS_MIDI_OUTPUT FALSE
     IS_MIDI_EFFECT FALSE
     EDITOR_WANTS_KEYBOARD_FOCUS TRUE
