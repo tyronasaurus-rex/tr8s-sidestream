@@ -1,0 +1,17 @@
+build/
+Builds/
+cmake-build-*/
+.vs/
+.idea/
+*.user
+*.suo
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+JuceLibraryCode/
+.DS_Store
+*.ilk
+*.pdb
+*.exp
+*.obj
