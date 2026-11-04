@@ -130,6 +130,9 @@ struct WasapiCapture::PairEndpoint final : private juce::AudioIODeviceCallback
         ring.resize (2, ringSize);
         ring.reset();
         ring.clearCounters();
+        resetAdaptive();
+        lastWriteTicks.store (juce::Time::getHighResolutionTicks(), std::memory_order_relaxed);
+        markedDead = false;
 
         manager.addAudioCallback (this);
         return {};
@@ -146,11 +149,52 @@ struct WasapiCapture::PairEndpoint final : private juce::AudioIODeviceCallback
         bufferSize = 0;
         latencyIn = 0;
         ring.reset();
+        resetAdaptive();
+        markedDead = false;
+    }
+
+    void resetAdaptive() noexcept
+    {
+        fracPhase = 0.0;
+        ratio = 1.0;
+        integ = 0.0;
     }
 
     bool isOpen() const noexcept
     {
         return manager.getCurrentAudioDevice() != nullptr && activeChannels > 0;
+    }
+
+    bool isCallbackAlive (double timeoutSec = 0.15) const noexcept
+    {
+        if (! isOpen())
+            return false;
+        const auto last = lastWriteTicks.load (std::memory_order_relaxed);
+        if (last == 0)
+            return false;
+        const double sec = juce::Time::highResolutionTicksToSeconds (
+            juce::Time::getHighResolutionTicks() - last);
+        return sec < timeoutSec;
+    }
+
+    bool isHealthy() const noexcept
+    {
+        return isOpen() && ! markedDead && isCallbackAlive();
+    }
+
+    /** PI toward FIFO midpoint; blend with masterRatio (1=follow master only). */
+    double updateRatio (int avail, int targetMid, double masterR, double masterBlend) noexcept
+    {
+        if (targetMid < 1)
+            targetMid = 1;
+
+        const double err = ((double) avail - (double) targetMid) / (double) targetMid;
+        integ = juce::jlimit (-0.04, 0.04, integ + err * 0.0008);
+        // Positive err (too full) → ratio > 1 (consume faster from capture).
+        double local = 1.0 + 0.12 * err + integ;
+        local = juce::jlimit (0.94, 1.06, local);
+        ratio = juce::jlimit (0.94, 1.06, (1.0 - masterBlend) * local + masterBlend * masterR);
+        return ratio;
     }
 
     void audioDeviceIOCallbackWithContext (const float* const* inputChannelData,
@@ -164,6 +208,10 @@ struct WasapiCapture::PairEndpoint final : private juce::AudioIODeviceCallback
 
         if (inputChannelData == nullptr || numSamples <= 0)
             return;
+
+        lastWriteTicks.store (juce::Time::getHighResolutionTicks(), std::memory_order_relaxed);
+        if (markedDead)
+            markedDead = false; // resurrect if callback returns
 
         const float* src[2] = {};
         const int n = juce::jmin (2, numInputChannels);
@@ -218,6 +266,12 @@ struct WasapiCapture::PairEndpoint final : private juce::AudioIODeviceCallback
     double sampleRate = 0.0;
     int bufferSize = 0;
     int latencyIn = 0;
+
+    std::atomic<juce::int64> lastWriteTicks { 0 };
+    double fracPhase = 0.0;
+    double ratio = 1.0;
+    double integ = 0.0;
+    bool markedDead = false;
 };
 
 //==============================================================================
@@ -279,10 +333,29 @@ int WasapiCapture::getTargetFillSamples() const noexcept
     return juce::jmax (256, (int) std::lround (rate * (double) latencyMs / 1000.0));
 }
 
+int WasapiCapture::midpointTargetSamples() const noexcept
+{
+    // Continuously aim for ~60% of configured depth (50–70% band).
+    return juce::jmax (128, (int) std::lround ((double) getTargetFillSamples() * 0.60));
+}
+
 int WasapiCapture::getPrimingTargetSamples() const noexcept
 {
-    // Pre-roll to full target depth before consuming (plus one WASAPI period).
-    return getTargetFillSamples() + juce::jmax (captureBufferSize, wasapiBufferSize);
+    // Pre-roll to midpoint + one period before adaptive SRC takes over.
+    return midpointTargetSamples() + juce::jmax (captureBufferSize, wasapiBufferSize);
+}
+
+int WasapiCapture::pickMasterPair() const noexcept
+{
+    if (aggregateOpen)
+    {
+        if (pairs[0] != nullptr && pairs[0]->isHealthy())
+            return 0;
+        for (int i = 1; i < kNumPairs; ++i)
+            if (pairs[(size_t) i] != nullptr && pairs[(size_t) i]->isHealthy())
+                return i;
+    }
+    return 0;
 }
 
 int WasapiCapture::ringCapacityForRate (double sampleRate) const noexcept
@@ -648,7 +721,8 @@ juce::String WasapiCapture::getCurrentDeviceName() const
 
 int WasapiCapture::getReportedLatencySamples() const noexcept
 {
-    return deviceLatencyIn + getTargetFillSamples() + juce::jmax (captureBufferSize, wasapiBufferSize);
+    // PDC reports the midpoint waterline we servo to (not the full depth ceiling).
+    return deviceLatencyIn + midpointTargetSamples() + juce::jmax (captureBufferSize, wasapiBufferSize);
 }
 
 int WasapiCapture::getAvailableToRead() const noexcept
@@ -659,7 +733,7 @@ int WasapiCapture::getAvailableToRead() const noexcept
         int openCount = 0;
         for (auto& p : pairs)
         {
-            if (p == nullptr || ! p->isOpen())
+            if (p == nullptr || ! p->isHealthy())
                 continue;
             ++openCount;
             minAvail = juce::jmin (minAvail, p->ring.getAvailableToRead());
@@ -667,7 +741,7 @@ int WasapiCapture::getAvailableToRead() const noexcept
         return openCount > 0 ? minAvail : 0;
     }
 
-    if (single != nullptr && single->isOpen())
+    if (single != nullptr && single->isHealthy())
         return single->ring.getAvailableToRead();
 
     return 0;
@@ -682,48 +756,96 @@ void WasapiCapture::readStems (float* const* dst, int numSamples) noexcept
         if (dst[ch] != nullptr)
             juce::FloatVectorOperations::clear (dst[ch], numSamples);
 
-    const int target = getTargetFillSamples();
-    const int highWater = target + juce::jmax (numSamples * 2, wasapiBufferSize * 2);
+    const int mid = midpointTargetSamples();
+    const int depth = getTargetFillSamples();
+    const int highClamp = juce::jmax (mid + numSamples * 4, (int) std::lround ((double) depth * 0.95));
 
-    auto readOne = [&] (PairEndpoint& ep, float* left, float* right)
+    // Mark dead pairs (callback stopped writing) so they don't ratchet underruns forever.
+    if (aggregateOpen)
     {
-        if (! ep.isOpen())
-            return;
+        for (auto& p : pairs)
+        {
+            if (p == nullptr || ! p->isOpen())
+                continue;
+            if (primed.load (std::memory_order_relaxed) && ! p->isCallbackAlive (0.15))
+                p->markedDead = true;
+        }
+    }
 
-        float* pairDst[2] = { left, right };
-        int avail = ep.ring.getAvailableToRead();
-
-        // Fast capture clock vs host: discard down toward target (non-blocking slip).
-        if (avail > highWater)
+    auto healthyMinAvail = [this]() -> int
+    {
+        int minAvail = INT_MAX;
+        int n = 0;
+        if (aggregateOpen)
         {
-            ep.ring.discard (avail - target);
-            avail = ep.ring.getAvailableToRead();
+            for (auto& p : pairs)
+            {
+                if (p == nullptr || ! p->isHealthy())
+                    continue;
+                ++n;
+                minAvail = juce::jmin (minAvail, p->ring.getAvailableToRead());
+            }
         }
-
-        if (avail >= numSamples)
+        else if (single != nullptr && single->isHealthy())
         {
-            ep.ring.read (pairDst, numSamples);
+            return single->ring.getAvailableToRead();
         }
-        else if (avail > 0)
-        {
-            // Partial: read what we have, leave the rest silent (already cleared).
-            ep.ring.read (pairDst, avail);
-            // Soft underrun already counted inside read when it runs short — avoid double-count
-            // by reading only avail; ring.read won't underrun if avail > 0 and we ask for avail.
-        }
-        else
-        {
-            ep.ring.read (pairDst, numSamples); // counts one underrun, zeros
-        }
+        return n > 0 ? minAvail : 0;
     };
 
     if (! primed.load (std::memory_order_relaxed))
     {
-        if (getAvailableToRead() < getPrimingTargetSamples())
-            return; // stay silent until safe depth on every open pair
+        if (healthyMinAvail() < getPrimingTargetSamples())
+            return;
         primed.store (true, std::memory_order_relaxed);
         clearXrunCounters();
+        for (auto& p : pairs)
+            if (p != nullptr)
+                p->resetAdaptive();
+        if (single != nullptr)
+            single->resetAdaptive();
     }
+
+    masterPairIndex = pickMasterPair();
+    double masterR = 1.0;
+
+    auto* master = (aggregateOpen && masterPairIndex >= 0 && masterPairIndex < kNumPairs)
+                       ? pairs[(size_t) masterPairIndex].get()
+                       : single.get();
+
+    if (master != nullptr && master->isHealthy())
+    {
+        // Emergency clamp if master blew past depth (coarse slip, then SRC).
+        const int mAvail = master->ring.getAvailableToRead();
+        if (mAvail > highClamp)
+            master->ring.discard (mAvail - mid);
+
+        masterR = master->updateRatio (master->ring.getAvailableToRead(), mid, 1.0, 0.0);
+    }
+    masterRatio.store (masterR, std::memory_order_relaxed);
+
+    auto readAdaptive = [&] (PairEndpoint& ep, float* left, float* right, bool isMaster)
+    {
+        float* pairDst[2] = { left, right };
+
+        if (! ep.isOpen() || ep.markedDead || ! ep.isCallbackAlive (0.20))
+        {
+            ep.markedDead = ep.isOpen(); // keep flag if still "open" but silent
+            return; // leave silence; do not underrun-count a dead callback
+        }
+
+        int avail = ep.ring.getAvailableToRead();
+        if (avail > highClamp)
+        {
+            ep.ring.discard (avail - mid);
+            avail = ep.ring.getAvailableToRead();
+        }
+
+        // Slaves blend 50% toward master ratio so host + pairs track one clock.
+        const double blend = isMaster ? 0.0 : 0.50;
+        const double r = ep.updateRatio (avail, mid, masterR, blend);
+        ep.ring.readResampled (pairDst, numSamples, r, ep.fracPhase);
+    };
 
     if (aggregateOpen)
     {
@@ -732,7 +854,7 @@ void WasapiCapture::readStems (float* const* dst, int numSamples) noexcept
             auto& p = pairs[(size_t) i];
             if (p == nullptr)
                 continue;
-            readOne (*p, dst[i * 2], dst[i * 2 + 1]);
+            readAdaptive (*p, dst[i * 2], dst[i * 2 + 1], i == masterPairIndex);
         }
         return;
     }
@@ -740,9 +862,10 @@ void WasapiCapture::readStems (float* const* dst, int numSamples) noexcept
     if (single != nullptr)
     {
         const int off = single->channelOffset;
-        readOne (*single,
-                 off < kMaxChannels ? dst[off] : nullptr,
-                 off + 1 < kMaxChannels ? dst[off + 1] : nullptr);
+        readAdaptive (*single,
+                      off < kMaxChannels ? dst[off] : nullptr,
+                      off + 1 < kMaxChannels ? dst[off + 1] : nullptr,
+                      true);
     }
 }
 
@@ -801,6 +924,33 @@ void WasapiCapture::clearXrunCounters() noexcept
             p->ring.clearCounters();
     if (single != nullptr)
         single->ring.clearCounters();
+}
+
+juce::String WasapiCapture::getPairHealthSummary() const
+{
+    if (! aggregateOpen)
+    {
+        if (single == nullptr)
+            return {};
+        return single->isHealthy() ? "OK" : "DEAD/stale";
+    }
+
+    juce::StringArray parts;
+    for (int i = 0; i < kNumPairs; ++i)
+    {
+        auto& p = pairs[(size_t) i];
+        juce::String s (pairLabel (i));
+        if (p == nullptr || ! p->isOpen())
+            s << "!";
+        else if (p->markedDead || ! p->isCallbackAlive())
+            s << "x"; // dead callback
+        else
+            s << "=" << juce::String (p->ratio, 3);
+        if (i == masterPairIndex)
+            s << "*";
+        parts.add (s);
+    }
+    return parts.joinIntoString (" ");
 }
 
 float WasapiCapture::getPeak (int channel) const noexcept

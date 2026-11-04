@@ -265,11 +265,14 @@ void TR8SSideStreamEditor::updateStatusLabel()
           << "Host " << juce::String (proc.getHostSampleRate(), 1) << " Hz / block "
           << proc.getHostBlockSize()
           << " | PDC " << cap.getReportedLatencySamples() << " smp"
-          << " | primed " << (cap.isPrimed() ? "yes" : "pre-roll…") << "\n"
-          << "FIFO " << cap.getAvailableToRead() << "/" << cap.getTargetFillSamples()
+          << " | primed " << (cap.isPrimed() ? "yes" : "pre-roll…")
+          << " | SRC " << juce::String (cap.getMasterRatio(), 4) << "\n"
+          << "FIFO " << cap.getAvailableToRead() << " (mid " << (int) std::lround (cap.getTargetFillSamples() * 0.60)
+          << " / depth " << cap.getTargetFillSamples() << ")"
           << " | underrun " << cap.getUnderruns()
           << " | overrun " << cap.getOverruns()
-          << " | slip " << cap.getSlips();
+          << " | slip " << cap.getSlips() << "\n"
+          << "Pairs " << cap.getPairHealthSummary();
 
         if (std::abs (cap.getCaptureSampleRate() - proc.getHostSampleRate()) > 1.0)
             s << "\nWARNING: sample rates differ — set Roland panel = Live.";

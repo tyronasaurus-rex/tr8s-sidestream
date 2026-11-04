@@ -38,7 +38,6 @@ public:
         return capacity - 1 - getAvailableToRead();
     }
 
-    /** Drop oldest samples (advance read). Used for overrun recovery + drift catch-up. */
     int discard (int numSamples) noexcept
     {
         if (numSamples <= 0 || capacity <= 0)
@@ -55,7 +54,6 @@ public:
         return n;
     }
 
-    /** Producer: write planar channel pointers. On overrun, discard oldest then retry. */
     int write (const float* const* src, int numSamples) noexcept
     {
         if (channels <= 0 || capacity <= 0 || src == nullptr || numSamples <= 0)
@@ -67,7 +65,6 @@ public:
             int space = getAvailableToWrite();
             if (space <= 0)
             {
-                // Slip: drop oldest quarter of capacity so capture keeps recent audio.
                 const int drop = juce::jmax (1, capacity / 4);
                 discard (drop);
                 overruns.fetch_add (1, std::memory_order_relaxed);
@@ -97,7 +94,6 @@ public:
         return written;
     }
 
-    /** Consumer: read up to numSamples; zero-pad remainder. Counts soft underrun once if short. */
     void read (float* const* dst, int numSamples) noexcept
     {
         if (dst == nullptr || numSamples <= 0)
@@ -130,6 +126,60 @@ public:
             readIndex.store ((r + chunk) % capacity, std::memory_order_release);
             readCount += chunk;
         }
+    }
+
+    /**
+     * Linear-interpolation SRC read into numOut host samples.
+     * ratio = capture samples consumed per host sample (1.0 = locked).
+     * fracPhase holds [0,1) residual between calls.
+     * Needs ~numOut*ratio+2 samples available; otherwise soft-underruns.
+     */
+    void readResampled (float* const* dst, int numOut, double ratio, double& fracPhase) noexcept
+    {
+        if (dst == nullptr || numOut <= 0 || channels <= 0 || capacity <= 0)
+            return;
+
+        ratio = juce::jlimit (0.90, 1.10, ratio);
+        if (fracPhase < 0.0 || fracPhase >= 1.0)
+            fracPhase = 0.0;
+
+        const int avail = getAvailableToRead();
+        const double need = (double) numOut * ratio + 2.0;
+        if (avail < (int) std::ceil (need))
+        {
+            underruns.fetch_add (1, std::memory_order_relaxed);
+            for (int ch = 0; ch < channels; ++ch)
+                if (dst[ch] != nullptr)
+                    juce::FloatVectorOperations::clear (dst[ch], numOut);
+            return;
+        }
+
+        const int r0 = readIndex.load (std::memory_order_relaxed);
+        double pos = fracPhase; // offset from r0 in capture samples
+        double maxPos = 0.0;
+
+        for (int i = 0; i < numOut; ++i)
+        {
+            const int i0 = (int) pos;
+            const float f = (float) (pos - (double) i0);
+            const int idx0 = (r0 + i0) % capacity;
+            const int idx1 = (idx0 + 1) % capacity;
+
+            for (int ch = 0; ch < channels; ++ch)
+            {
+                if (dst[ch] == nullptr)
+                    continue;
+                const float* base = storage.data() + (size_t) ch * (size_t) capacity;
+                dst[ch][i] = base[idx0] * (1.0f - f) + base[idx1] * f;
+            }
+
+            pos += ratio;
+            maxPos = pos;
+        }
+
+        const int advance = (int) maxPos; // floor
+        fracPhase = maxPos - (double) advance;
+        readIndex.store ((r0 + advance) % capacity, std::memory_order_release);
     }
 
     void reset() noexcept

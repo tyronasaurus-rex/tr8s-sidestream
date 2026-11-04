@@ -16,7 +16,7 @@ public:
     static constexpr const char* kSharedWasapi = "Windows Audio";
     static constexpr const char* kExclusiveWasapi = "Windows Audio (Exclusive Mode)";
 
-    static constexpr int kDefaultLatencyMs = 100;
+    static constexpr int kDefaultLatencyMs = 120;
     static constexpr int kDefaultWasapiBuffer = 512;
     static constexpr int kMinLatencyMs = 40;
     static constexpr int kMaxLatencyMs = 250;
@@ -74,6 +74,10 @@ public:
     int getSlips() const noexcept;
     void clearXrunCounters() noexcept;
 
+    int getMasterPairIndex() const noexcept { return masterPairIndex; }
+    double getMasterRatio() const noexcept { return masterRatio.load (std::memory_order_relaxed); }
+    juce::String getPairHealthSummary() const;
+
     float getPeak (int channel) const noexcept;
     void decayPeaks (float factor) noexcept;
 
@@ -97,6 +101,8 @@ private:
                              double preferredSampleRate,
                              int preferredBufferSize);
     int ringCapacityForRate (double sampleRate) const noexcept;
+    int midpointTargetSamples() const noexcept;
+    int pickMasterPair() const noexcept;
     juce::Array<DeviceInfo> discoverPhysicalDevices() const;
 
     std::array<std::unique_ptr<PairEndpoint>, kNumPairs> pairs;
@@ -110,6 +116,8 @@ private:
     double captureSampleRate = 0.0;
     int captureBufferSize = 0;
     int deviceLatencyIn = 0;
+    int masterPairIndex = 0;
+    std::atomic<double> masterRatio { 1.0 };
     juce::String currentName;
     juce::String lastError;
     StatusCallback statusCallback;
