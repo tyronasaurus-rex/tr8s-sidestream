@@ -4,7 +4,7 @@ Minimal **VST3 instrument** that keeps Ableton on **Tascam Model 12 ASIO** while
 
 This is an MVP / spike — not Overbridge. No MIDI editor, no total recall, no Roland proprietary protocol reverse-engineering.
 
-**Version:** 0.2.0 — multi-endpoint aggregation (`TR-8S (all stems)`)
+**Version:** 0.2.1 — multi-endpoint aggregation (`TR-8S (all stems)`; WASAPI `initialise` fix)
 
 ## Requirements
 
@@ -75,8 +75,10 @@ Roland exposes TR-8S as **six stereo WASAPI endpoints**, not one 12-ch device:
 | --- | --- |
 | “could not be opened” | Need v0.1.1+ (MIDI event bus). See Log.txt for `event input bus`. |
 | Aggregate missing from list | Refresh; confirm all six `IN n-(n+1) (TR-8S)` exist under shared WASAPI. |
+| `Opened 0/6` / `Opened null device` | Fixed in **0.2.1** (manager must `initialise` before open). Reinstall + rescan. |
 | Only 2 meters move | You opened a single stereo endpoint — use **all stems**. |
 | Partial pairs in status (`IN 7-8!`) | That endpoint failed to open; close other apps using it; retry. |
+| Canary pair failed (IN 1-2) | Same open path as single-endpoint; try opening `IN 1-2 (TR-8S) [Windows Audio]` alone first. |
 
 Log: `%APPDATA%\Ableton\Live 12.3\Preferences\Log.txt`
 

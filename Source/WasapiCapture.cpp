@@ -40,10 +40,10 @@ struct WasapiCapture::PairEndpoint final : private juce::AudioIODeviceCallback
     {
         close();
 
-        manager.setCurrentAudioDeviceType (typeName.isNotEmpty() ? typeName
-                                                                  : juce::String (kSharedWasapi),
-                                           true);
-
+        // Fresh AudioDeviceManager has empty availableDeviceTypes until initialise/scan.
+        // Calling setAudioDeviceSetup alone hits getCurrentDeviceTypeObject()==nullptr and
+        // JUCE returns {} while leaving the device null — which produced
+        // "Opened null device: IN X-Y (TR-8S)" for all six aggregate pairs.
         juce::AudioDeviceManager::AudioDeviceSetup setup;
         setup.inputDeviceName = deviceName;
         setup.outputDeviceName.clear();
@@ -56,26 +56,55 @@ struct WasapiCapture::PairEndpoint final : private juce::AudioIODeviceCallback
         setup.inputChannels.setBit (0);
         setup.inputChannels.setBit (1);
 
-        auto err = manager.setAudioDeviceSetup (setup, true);
+        const juce::String type = typeName.isNotEmpty() ? typeName
+                                                        : juce::String (kSharedWasapi);
+
+        // Creates device types + sets numInputChansNeeded=2 (required for default channel mask).
+        auto err = manager.initialise (2, 0, nullptr, false, deviceName, &setup);
+
+        const bool wrongType = manager.getCurrentAudioDeviceType() != type;
+        const bool wrongName = manager.getAudioDeviceSetup().inputDeviceName != deviceName;
+        const bool nullDev = manager.getCurrentAudioDevice() == nullptr;
+
+        if (err.isNotEmpty() || wrongType || wrongName || nullDev)
+        {
+            // Close first so setCurrentAudioDeviceType does not sleep 1.5s per pair.
+            manager.closeAudioDevice();
+            manager.setCurrentAudioDeviceType (type, false);
+            manager.closeAudioDevice();
+            err = manager.setAudioDeviceSetup (setup, true);
+        }
+
         if (err.isNotEmpty())
         {
+            // Last-chance: default channel mask only.
             setup.useDefaultInputChannels = true;
             setup.inputChannels.clear();
             err = manager.setAudioDeviceSetup (setup, true);
         }
 
         if (err.isNotEmpty())
-            return err;
+            return type + " / " + deviceName + ": " + err;
 
         auto* dev = manager.getCurrentAudioDevice();
         if (dev == nullptr)
-            return "Opened null device: " + deviceName;
+            return "Null device after initialise: " + type + " / " + deviceName
+                   + " (availableTypes=" + juce::String (manager.getAvailableDeviceTypes().size()) + ")";
+
+        if (manager.getAudioDeviceSetup().inputDeviceName != deviceName)
+            return "Wrong input opened: wanted '" + deviceName + "', got '"
+                   + manager.getAudioDeviceSetup().inputDeviceName + "' ["
+                   + manager.getCurrentAudioDeviceType() + "]";
 
         deviceNameOpen = deviceName;
+        typeNameOpen = type;
         sampleRate = dev->getCurrentSampleRate();
         bufferSize = dev->getCurrentBufferSizeSamples();
         latencyIn = dev->getInputLatencyInSamples();
         activeChannels = juce::jmin (2, dev->getActiveInputChannels().countNumberOfSetBits());
+
+        if (activeChannels <= 0)
+            return "Device open but 0 input channels: " + deviceName;
 
         const int ringSize = juce::jmax (8192, (int) std::ceil (sampleRate * 0.25));
         ring.resize (2, ringSize);
@@ -91,6 +120,7 @@ struct WasapiCapture::PairEndpoint final : private juce::AudioIODeviceCallback
         manager.removeAudioCallback (this);
         manager.closeAudioDevice();
         deviceNameOpen.clear();
+        typeNameOpen.clear();
         activeChannels = 0;
         sampleRate = 0.0;
         bufferSize = 0;
@@ -163,6 +193,7 @@ struct WasapiCapture::PairEndpoint final : private juce::AudioIODeviceCallback
     juce::AudioDeviceManager manager;
     PlanarRingBuffer ring;
     juce::String deviceNameOpen;
+    juce::String typeNameOpen;
     int activeChannels = 0;
     double sampleRate = 0.0;
     int bufferSize = 0;
@@ -298,7 +329,8 @@ juce::String WasapiCapture::openAggregate (double preferredSampleRate, int prefe
     closeDevice();
     lastError.clear();
 
-    auto physical = discoverPhysicalDevices();
+    // Refresh so we use the same DeviceInfo name+typeName the combo lists for single opens.
+    refreshDeviceList();
 
     struct FoundPair
     {
@@ -309,23 +341,27 @@ juce::String WasapiCapture::openAggregate (double preferredSampleRate, int prefe
     FoundPair found[kNumPairs];
     int foundCount = 0;
 
-    // Prefer shared WASAPI for each pair index.
-    for (int pass = 0; pass < 2; ++pass)
     {
-        const juce::String wantType = (pass == 0 ? juce::String (kSharedWasapi)
-                                                 : juce::String (kExclusiveWasapi));
+        const juce::ScopedLock sl (deviceListLock);
 
-        for (const auto& d : physical)
+        // Pass 1: shared Windows Audio (preferred). Pass 2: exclusive fallback.
+        for (int pass = 0; pass < 2; ++pass)
         {
-            if (d.typeName != wantType)
-                continue;
+            const juce::String wantType = (pass == 0 ? juce::String (kSharedWasapi)
+                                                     : juce::String (kExclusiveWasapi));
 
-            const int idx = pairIndexFromDeviceName (d.name);
-            if (idx < 0 || found[idx].name.isNotEmpty())
-                continue;
+            for (const auto& d : devices)
+            {
+                if (d.isAggregate || d.typeName != wantType)
+                    continue;
 
-            found[idx] = { d.name, d.typeName };
-            ++foundCount;
+                const int idx = pairIndexFromDeviceName (d.name);
+                if (idx < 0 || found[idx].name.isNotEmpty())
+                    continue;
+
+                found[idx] = { d.name, d.typeName };
+                ++foundCount;
+            }
         }
     }
 
@@ -347,6 +383,7 @@ juce::String WasapiCapture::openAggregate (double preferredSampleRate, int prefe
     int buf = 0;
     int latency = 0;
 
+    // Open pair 0 first as a canary — same identity as picking IN 1-2 alone.
     for (int i = 0; i < kNumPairs; ++i)
     {
         auto err = pairs[(size_t) i]->open (found[i].name,
@@ -355,7 +392,14 @@ juce::String WasapiCapture::openAggregate (double preferredSampleRate, int prefe
                                             preferredBufferSize);
         if (err.isNotEmpty())
         {
-            errors.add (found[i].name + ": " + err);
+            errors.add ("[" + found[i].typeName + "] " + found[i].name + " → " + err);
+            if (i == 0)
+            {
+                lastError = "Canary pair failed (IN 1-2). " + err;
+                closeDevice();
+                notifyStatus();
+                return lastError;
+            }
             continue;
         }
 
