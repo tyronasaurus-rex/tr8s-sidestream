@@ -38,6 +38,7 @@ private:
     static constexpr int kMeters = TR8SSideStreamProcessor::kNumStems;
     std::array<juce::Rectangle<int>, kMeters> meterBounds {};
     std::array<float, kMeters> meterLevels {};
+    int statusTick = 0;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (TR8SSideStreamEditor)
 };

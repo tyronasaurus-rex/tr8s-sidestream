@@ -10,7 +10,7 @@ TR8SSideStreamEditor::TR8SSideStreamEditor (TR8SSideStreamProcessor& p)
     titleLabel.setJustificationType (juce::Justification::centredLeft);
     addAndMakeVisible (titleLabel);
 
-    hintLabel.setText ("Use “TR-8S (all stems)”. Depth≈PDC; reopen after changing buffer settings.",
+    hintLabel.setText ("Prefer 2/4 stems if 6 underruns. Status = 1s averages. Health dump → Documents.",
                        juce::dontSendNotification);
     hintLabel.setFont (juce::FontOptions (12.5f));
     hintLabel.setJustificationType (juce::Justification::centredLeft);
@@ -100,7 +100,7 @@ TR8SSideStreamEditor::TR8SSideStreamEditor (TR8SSideStreamProcessor& p)
     }
 
     updateStatusLabel();
-    startTimerHz (24);
+    startTimerHz (10); // meters ~10 Hz; status text refreshed at 1 Hz
 }
 
 TR8SSideStreamEditor::~TR8SSideStreamEditor()
@@ -168,7 +168,7 @@ void TR8SSideStreamEditor::resized()
     latencySlider.setBounds (settings);
 
     r.removeFromTop (10);
-    statusLabel.setBounds (r.removeFromTop (140));
+    statusLabel.setBounds (r.removeFromTop (200));
     r.removeFromTop (8);
 
     auto meters = r.removeFromTop (160);
@@ -182,9 +182,16 @@ void TR8SSideStreamEditor::timerCallback()
 {
     auto& cap = proc.getCapture();
     for (int i = 0; i < kMeters; ++i)
-        meterLevels[(size_t) i] = cap.getPeak (i);
-    cap.decayPeaks (0.85f);
-    updateStatusLabel();
+        meterLevels[(size_t) i] = juce::jmax (meterLevels[(size_t) i] * 0.92f, cap.getPeak (i));
+    cap.decayPeaks (0.92f); // slower decay = peak hold feel
+
+    // Frozen 1s rate windows + status text at ~1 Hz (avoids flicker Tyron couldn't read).
+    if (++statusTick >= 10)
+    {
+        statusTick = 0;
+        cap.tickDiagnostics();
+        updateStatusLabel();
+    }
     repaint();
 }
 
@@ -201,11 +208,18 @@ void TR8SSideStreamEditor::refreshDeviceCombo()
     {
         const auto& d = devices.getReference (i);
         juce::String label = d.name;
-        label += d.isAggregate ? "  [12 mono from IN 1-2…11-12]"
-                              : ("  [" + d.typeName + "]");
-        deviceBox.addItem (label, id);
         if (d.isAggregate)
-            aggregateIndex = i;
+        {
+            label += "  [" + juce::String (d.aggregatePairs) + " pairs / "
+                     + juce::String (d.inputChannels) + " mono]";
+            if (d.aggregatePairs == 6 && aggregateIndex < 0)
+                aggregateIndex = i;
+        }
+        else
+        {
+            label += "  [" + d.typeName + "]";
+        }
+        deviceBox.addItem (label, id);
         ++id;
     }
 
@@ -238,6 +252,10 @@ void TR8SSideStreamEditor::openSelectedDevice()
         name = name.substring (0, bracket);
     if (name.startsWith (WasapiCapture::kAggregateExclusiveName))
         name = WasapiCapture::kAggregateExclusiveName;
+    else if (name.startsWith (WasapiCapture::kAggregate4Name))
+        name = WasapiCapture::kAggregate4Name;
+    else if (name.startsWith (WasapiCapture::kAggregate2Name))
+        name = WasapiCapture::kAggregate2Name;
     else if (name.startsWith (WasapiCapture::kAggregateName))
         name = WasapiCapture::kAggregateName;
 
@@ -275,18 +293,30 @@ void TR8SSideStreamEditor::updateStatusLabel()
           << " | underrun " << cap.getUnderruns()
           << " | overrun " << cap.getOverruns()
           << " | slip " << cap.getSlips() << "\n"
+          << "Rates = 1s avg (pk = peak since open). Healthy: cb/s~47–94 wr~48000\n"
           << cap.getPairHealthSummary();
+
+        if (cap.getArchitectureNote().isNotEmpty())
+            s << "\nNOTE: " << cap.getArchitectureNote();
+
+        const auto dump = cap.getLastHealthDumpFile();
+        if (dump != juce::File())
+            s << "\nDump: " << dump.getFullPathName();
+        else
+            s << "\nDump: writing 5s capture health to Documents\\tr8s-sidestream-health.txt …";
 
         if (std::abs (cap.getCaptureSampleRate() - proc.getHostSampleRate()) > 1.0)
             s << "\nWARNING: sample rates differ — set Roland panel = Live.";
     }
     else
     {
-        s << "Closed. Open “TR-8S (all stems)” — 0.4.2 uses exclusive WASAPI first.\n"
-          << "Depth 150, WASAPI 1024. After Open expect cb/s~90 wr~48000 excl@1024 on all 6.\n"
+        s << "Closed. 0.4.3: exclusive first; “all stems” auto-falls back 6→4→2 if wr can’t sustain.\n"
+          << "Try “TR-8S (2 stems)” first. Depth 150, WASAPI 1024. Status shows 1s averages.\n"
           << "Devices: " << proc.getCapture().getDevices().size();
         if (cap.getLastError().isNotEmpty())
             s << "\nLast error: " << cap.getLastError();
+        if (cap.getArchitectureNote().isNotEmpty())
+            s << "\nNOTE: " << cap.getArchitectureNote();
     }
 
     statusLabel.setText (s, juce::dontSendNotification);

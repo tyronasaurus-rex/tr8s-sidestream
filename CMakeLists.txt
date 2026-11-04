@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(TR8SSideStream VERSION 0.4.2)
+project(TR8SSideStream VERSION 0.4.3)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
