@@ -4,11 +4,6 @@
 
 namespace
 {
-juce::StringArray wasapiTypeNames()
-{
-    return { WasapiCapture::kSharedWasapi, WasapiCapture::kExclusiveWasapi };
-}
-
 /** Expected stem-pair labels in USB INDIV order. */
 const char* pairLabel (int index)
 {
@@ -18,6 +13,18 @@ const char* pairLabel (int index)
     if (index < 0 || index >= WasapiCapture::kNumPairs)
         return "?";
     return labels[index];
+}
+
+juce::WASAPIDeviceMode modeFromTypeName (const juce::String& typeName)
+{
+    if (typeName == WasapiCapture::kExclusiveWasapi)
+        return juce::WASAPIDeviceMode::exclusive;
+    return juce::WASAPIDeviceMode::shared;
+}
+
+const char* shortModeName (juce::WASAPIDeviceMode mode)
+{
+    return mode == juce::WASAPIDeviceMode::exclusive ? "excl" : "shared";
 }
 } // namespace
 
@@ -34,6 +41,9 @@ struct WasapiCapture::PairEndpoint final : private juce::AudioIODeviceCallback
         close();
     }
 
+    /** Open one TR-8S stereo endpoint via a dedicated WASAPI AudioIODevice.
+        Avoids AudioDeviceManager (heavy + shared-state); each pair gets its own
+        IAudioClient thread. Exclusive mode is required for reliable 6-client capture. */
     juce::String open (const juce::String& deviceName,
                        const juce::String& typeName,
                        double preferredSampleRate,
@@ -41,89 +51,60 @@ struct WasapiCapture::PairEndpoint final : private juce::AudioIODeviceCallback
     {
         close();
 
-        // Fresh AudioDeviceManager has empty availableDeviceTypes until initialise/scan.
-        // Calling setAudioDeviceSetup alone hits getCurrentDeviceTypeObject()==nullptr and
-        // JUCE returns {} while leaving the device null — which produced
-        // "Opened null device: IN X-Y (TR-8S)" for all six aggregate pairs.
-        // Prefer plugin WASAPI period; fall back to host hint. Same value used for all pairs.
         const int period = WasapiCapture::snapWasapiBuffer (
             owner.wasapiBufferSize > 0 ? owner.wasapiBufferSize
                                        : (preferredBufferSize > 0 ? preferredBufferSize : kDefaultWasapiBuffer));
+        const double rate = preferredSampleRate > 0.0 ? preferredSampleRate : 48000.0;
+        const auto mode = modeFromTypeName (typeName.isNotEmpty() ? typeName
+                                                                  : juce::String (kExclusiveWasapi));
 
-        juce::AudioDeviceManager::AudioDeviceSetup setup;
-        setup.inputDeviceName = deviceName;
-        setup.outputDeviceName.clear();
-        setup.sampleRate = preferredSampleRate > 0.0 ? preferredSampleRate : 48000.0;
-        setup.bufferSize = period;
-        setup.useDefaultInputChannels = true;
-        setup.useDefaultOutputChannels = false;
-        setup.outputChannels.clear();
-        setup.inputChannels.clear();
-        setup.inputChannels.setBit (0);
-        setup.inputChannels.setBit (1);
+        deviceType.reset (juce::AudioIODeviceType::createAudioIODeviceType_WASAPI (mode));
+        if (deviceType == nullptr)
+            return "WASAPI type unavailable (" + juce::String (shortModeName (mode)) + ")";
 
-        const juce::String type = typeName.isNotEmpty() ? typeName
-                                                        : juce::String (kSharedWasapi);
+        deviceType->scanForDevices();
+        const auto inputs = deviceType->getDeviceNames (true);
+        if (! inputs.contains (deviceName))
+            return juce::String (shortModeName (mode)) + " device missing: " + deviceName
+                   + " (scan=" + juce::String (inputs.size()) + ")";
 
-        // Creates device types + sets numInputChansNeeded=2 (required for default channel mask).
-        auto err = manager.initialise (2, 0, nullptr, false, deviceName, &setup);
+        device.reset (deviceType->createDevice ({}, deviceName));
+        if (device == nullptr)
+            return "createDevice failed (" + juce::String (shortModeName (mode)) + "): " + deviceName;
 
-        const bool wrongType = manager.getCurrentAudioDeviceType() != type;
-        const bool wrongName = manager.getAudioDeviceSetup().inputDeviceName != deviceName;
-        const bool nullDev = manager.getCurrentAudioDevice() == nullptr;
+        juce::BigInteger inCh;
+        inCh.setBit (0);
+        inCh.setBit (1);
 
-        if (err.isNotEmpty() || wrongType || wrongName || nullDev)
+        auto err = device->open (inCh, juce::BigInteger {}, rate, period);
+        if (err.isNotEmpty())
         {
-            // Close first so setCurrentAudioDeviceType does not sleep 1.5s per pair.
-            manager.closeAudioDevice();
-            manager.setCurrentAudioDeviceType (type, false);
-            manager.closeAudioDevice();
-            err = manager.setAudioDeviceSetup (setup, true);
+            // Retry with whatever channel mask the device defaults to.
+            juce::BigInteger allIn;
+            const int nIn = device->getInputChannelNames().size();
+            for (int i = 0; i < juce::jmin (2, nIn); ++i)
+                allIn.setBit (i);
+            err = device->open (allIn, juce::BigInteger {}, rate, period);
         }
 
         if (err.isNotEmpty())
         {
-            // Last-chance: default channel mask only.
-            setup.useDefaultInputChannels = true;
-            setup.inputChannels.clear();
-            err = manager.setAudioDeviceSetup (setup, true);
+            device.reset();
+            deviceType.reset();
+            return juce::String (shortModeName (mode)) + " / " + deviceName + ": " + err;
         }
-
-        if (err.isNotEmpty())
-            return type + " / " + deviceName + ": " + err;
-
-        auto* dev = manager.getCurrentAudioDevice();
-        if (dev == nullptr)
-            return "Null device after initialise: " + type + " / " + deviceName
-                   + " (availableTypes=" + juce::String (manager.getAvailableDeviceTypes().size()) + ")";
-
-        if (manager.getAudioDeviceSetup().inputDeviceName != deviceName)
-            return "Wrong input opened: wanted '" + deviceName + "', got '"
-                   + manager.getAudioDeviceSetup().inputDeviceName + "' ["
-                   + manager.getCurrentAudioDeviceType() + "]";
 
         deviceNameOpen = deviceName;
-        typeNameOpen = type;
-        sampleRate = dev->getCurrentSampleRate();
-        bufferSize = dev->getCurrentBufferSizeSamples();
-        latencyIn = dev->getInputLatencyInSamples();
-        activeChannels = juce::jmin (2, dev->getActiveInputChannels().countNumberOfSetBits());
+        typeNameOpen = deviceType->getTypeName();
+        sampleRate = device->getCurrentSampleRate();
+        bufferSize = device->getCurrentBufferSizeSamples();
+        latencyIn = device->getInputLatencyInSamples();
+        activeChannels = juce::jmin (2, device->getActiveInputChannels().countNumberOfSetBits());
 
         if (activeChannels <= 0)
-            return "Device open but 0 input channels: " + deviceName;
-
-        // Re-assert period if driver ignored our request.
-        if (std::abs (bufferSize - period) > 8)
         {
-            auto again = manager.getAudioDeviceSetup();
-            again.bufferSize = period;
-            again.sampleRate = setup.sampleRate;
-            manager.setAudioDeviceSetup (again, true);
-            if (auto* d2 = manager.getCurrentAudioDevice())
-            {
-                bufferSize = d2->getCurrentBufferSizeSamples();
-                sampleRate = d2->getCurrentSampleRate();
-            }
+            close();
+            return "Device open but 0 input channels: " + deviceName;
         }
 
         const int ringSize = owner.ringCapacityForRate (sampleRate);
@@ -135,16 +116,31 @@ struct WasapiCapture::PairEndpoint final : private juce::AudioIODeviceCallback
         callbackCount.store (0, std::memory_order_relaxed);
         samplesWritten.store (0, std::memory_order_relaxed);
         diagEpochTicks = juce::Time::getHighResolutionTicks();
+        diagCbAnchor = 0;
+        diagWrAnchor = 0;
         markedDead = false;
 
-        manager.addAudioCallback (this);
+        // start() registers this callback and launches the WASAPI thread.
+        device->start (this);
+
+        if (! device->isPlaying())
+        {
+            close();
+            return "WASAPI start failed (" + juce::String (shortModeName (mode)) + "): " + deviceName;
+        }
+
         return {};
     }
 
     void close()
     {
-        manager.removeAudioCallback (this);
-        manager.closeAudioDevice();
+        if (device != nullptr)
+        {
+            device->stop();
+            device->close();
+            device.reset();
+        }
+        deviceType.reset();
         deviceNameOpen.clear();
         typeNameOpen.clear();
         activeChannels = 0;
@@ -165,7 +161,19 @@ struct WasapiCapture::PairEndpoint final : private juce::AudioIODeviceCallback
 
     bool isOpen() const noexcept
     {
-        return manager.getCurrentAudioDevice() != nullptr && activeChannels > 0;
+        return device != nullptr && device->isOpen() && activeChannels > 0;
+    }
+
+    uint64_t callbackDelta() const noexcept
+    {
+        return callbackCount.load (std::memory_order_relaxed);
+    }
+
+    void resetRateWindow() noexcept
+    {
+        diagEpochTicks = juce::Time::getHighResolutionTicks();
+        diagCbAnchor = callbackCount.load (std::memory_order_relaxed);
+        diagWrAnchor = samplesWritten.load (std::memory_order_relaxed);
     }
 
     bool isCallbackAlive (double timeoutSec = 0.50) const noexcept
@@ -243,15 +251,15 @@ struct WasapiCapture::PairEndpoint final : private juce::AudioIODeviceCallback
         ring.write (src, numSamples);
     }
 
-    void audioDeviceAboutToStart (juce::AudioIODevice* device) override
+    void audioDeviceAboutToStart (juce::AudioIODevice* dev) override
     {
-        if (device == nullptr)
+        if (dev == nullptr)
             return;
 
-        sampleRate = device->getCurrentSampleRate();
-        bufferSize = device->getCurrentBufferSizeSamples();
-        latencyIn = device->getInputLatencyInSamples();
-        activeChannels = juce::jmin (2, device->getActiveInputChannels().countNumberOfSetBits());
+        sampleRate = dev->getCurrentSampleRate();
+        bufferSize = dev->getCurrentBufferSizeSamples();
+        latencyIn = dev->getInputLatencyInSamples();
+        activeChannels = juce::jmin (2, dev->getActiveInputChannels().countNumberOfSetBits());
         owner.notifyStatus();
     }
 
@@ -263,7 +271,8 @@ struct WasapiCapture::PairEndpoint final : private juce::AudioIODeviceCallback
     WasapiCapture& owner;
     int pairIndex = 0;
     int channelOffset = 0;
-    juce::AudioDeviceManager manager;
+    std::unique_ptr<juce::AudioIODeviceType> deviceType;
+    std::unique_ptr<juce::AudioIODevice> device;
     PlanarRingBuffer ring;
     juce::String deviceNameOpen;
     juce::String typeNameOpen;
@@ -275,7 +284,9 @@ struct WasapiCapture::PairEndpoint final : private juce::AudioIODeviceCallback
     std::atomic<juce::int64> lastWriteTicks { 0 };
     std::atomic<uint64_t> callbackCount { 0 };
     std::atomic<uint64_t> samplesWritten { 0 };
-    juce::int64 diagEpochTicks = 0;
+    mutable juce::int64 diagEpochTicks = 0;
+    mutable uint64_t diagCbAnchor = 0;
+    mutable uint64_t diagWrAnchor = 0;
     double fracPhase = 0.0;
     double ratio = 1.0;
     double integ = 0.0;
@@ -394,11 +405,16 @@ juce::Array<WasapiCapture::DeviceInfo> WasapiCapture::discoverPhysicalDevices() 
 {
     juce::Array<DeviceInfo> found;
 
-    // Temporary manager only for enumeration (does not hold devices open).
-    juce::AudioDeviceManager enumerator;
-    for (auto* type : enumerator.getAvailableDeviceTypes())
+    const juce::WASAPIDeviceMode modes[] = {
+        juce::WASAPIDeviceMode::shared,
+        juce::WASAPIDeviceMode::exclusive
+    };
+
+    for (auto mode : modes)
     {
-        if (type == nullptr || ! wasapiTypeNames().contains (type->getTypeName()))
+        std::unique_ptr<juce::AudioIODeviceType> type (
+            juce::AudioIODeviceType::createAudioIODeviceType_WASAPI (mode));
+        if (type == nullptr)
             continue;
 
         type->scanForDevices();
@@ -500,96 +516,214 @@ juce::String WasapiCapture::openAggregate (double preferredSampleRate, int prefe
         juce::String typeName;
     };
 
-    FoundPair found[kNumPairs];
-    int foundCount = 0;
-    const juce::String primaryType = exclusive ? juce::String (kExclusiveWasapi)
-                                               : juce::String (kSharedWasapi);
-    const juce::String fallbackType = exclusive ? juce::String (kSharedWasapi)
-                                                : juce::String (kExclusiveWasapi);
-
+    auto collectPairs = [this] (bool wantExclusive, FoundPair out[kNumPairs]) -> int
     {
+        for (int i = 0; i < kNumPairs; ++i)
+            out[i] = {};
+
+        const juce::String primaryType = wantExclusive ? juce::String (kExclusiveWasapi)
+                                                       : juce::String (kSharedWasapi);
+        const juce::String fallbackType = wantExclusive ? juce::String (kSharedWasapi)
+                                                        : juce::String (kExclusiveWasapi);
+        int foundCount = 0;
         const juce::ScopedLock sl (deviceListLock);
 
         for (int pass = 0; pass < 2; ++pass)
         {
             const juce::String wantType = (pass == 0 ? primaryType : fallbackType);
-
             for (const auto& d : devices)
             {
                 if (d.isAggregate || d.typeName != wantType)
                     continue;
-
                 const int idx = pairIndexFromDeviceName (d.name);
-                if (idx < 0 || found[idx].name.isNotEmpty())
+                if (idx < 0 || out[idx].name.isNotEmpty())
                     continue;
-
-                found[idx] = { d.name, d.typeName };
+                out[idx] = { d.name, d.typeName };
                 ++foundCount;
             }
         }
-    }
+        return foundCount;
+    };
 
-    if (foundCount < kNumPairs)
+    auto openAll = [&] (FoundPair found[kNumPairs], juce::StringArray& errors,
+                        double& rate, int& buf, int& latency) -> int
     {
-        juce::String missing;
-        for (int i = 0; i < kNumPairs; ++i)
-            if (found[i].name.isEmpty())
-                missing += juce::String (pairLabel (i)) + " ";
+        int opened = 0;
+        rate = 0.0;
+        buf = 0;
+        latency = 0;
+        errors.clear();
 
-        lastError = "Missing TR-8S stem pairs (need 6): " + missing.trim();
-        notifyStatus();
-        return lastError;
-    }
+        for (int i = 0; i < kNumPairs; ++i)
+        {
+            // Stagger opens slightly so USB/WASAPI can settle between clients.
+            if (i > 0)
+                juce::Thread::sleep (30);
+
+            auto err = pairs[(size_t) i]->open (found[i].name,
+                                                found[i].typeName,
+                                                preferredSampleRate,
+                                                preferredBufferSize);
+            if (err.isNotEmpty())
+            {
+                errors.add (juce::String (pairLabel (i)) + ": " + err);
+                if (i == 0)
+                    return 0;
+                continue;
+            }
+
+            ++opened;
+            rate = pairs[(size_t) i]->sampleRate;
+            buf = juce::jmax (buf, pairs[(size_t) i]->bufferSize);
+            latency = juce::jmax (latency, pairs[(size_t) i]->latencyIn);
+        }
+        return opened;
+    };
+
+    auto countLiveCallbacks = [this]() -> int
+    {
+        int live = 0;
+        for (auto& p : pairs)
+        {
+            if (p == nullptr || ! p->isOpen())
+                continue;
+            // After probe window, expect many callbacks. Threshold is intentionally low
+            // so a slightly slow start still counts; real healthy is ~30+ in 350ms.
+            if (p->callbackDelta() >= 8)
+                ++live;
+        }
+        return live;
+    };
+
+    // Force a usable period for 6-client capture (UI may still request 512).
+    wasapiBufferSize = snapWasapiBuffer (juce::jmax (wasapiBufferSize, preferredBufferSize, 512));
+
+    // Try exclusive first (even when UI says shared) — shared 6-client WASAPI starves
+    // (~2 cb/s, half the pairs DEAD). Fall back to shared only if exclusive can't open.
+    const bool tryOrder[] = { true, false };
+    const int periodTries[] = {
+        juce::jmax (wasapiBufferSize, 1024),
+        2048,
+        juce::jmax (wasapiBufferSize, 512)
+    };
 
     juce::StringArray errors;
     int opened = 0;
+    int live = 0;
     double rate = 0.0;
     int buf = 0;
     int latency = 0;
+    bool usedExclusive = exclusive;
+    juce::String attemptLog;
 
-    // Open pair 0 first as a canary — same identity as picking IN 1-2 alone.
-    for (int i = 0; i < kNumPairs; ++i)
+    for (bool wantExcl : tryOrder)
     {
-        auto err = pairs[(size_t) i]->open (found[i].name,
-                                            found[i].typeName,
-                                            preferredSampleRate,
-                                            preferredBufferSize);
-        if (err.isNotEmpty())
+        // If caller insisted on exclusive-only menu entry, skip shared fallback on success path;
+        // still allow shared if exclusive fails entirely.
+        juce::ignoreUnused (exclusive);
+
+        for (int period : periodTries)
         {
-            errors.add ("[" + found[i].typeName + "] " + found[i].name + " → " + err);
-            if (i == 0)
+            closeDevice();
+            wasapiBufferSize = snapWasapiBuffer (period);
+
+            FoundPair found[kNumPairs];
+            const int foundCount = collectPairs (wantExcl, found);
+            if (foundCount < kNumPairs)
             {
-                lastError = "Canary pair failed (IN 1-2). " + err;
-                closeDevice();
-                notifyStatus();
-                return lastError;
+                attemptLog += (wantExcl ? "excl" : "shared");
+                attemptLog += "@" + juce::String (period) + ":missing-pairs("
+                              + juce::String (foundCount) + ") ";
+                continue;
             }
-            continue;
+
+            opened = openAll (found, errors, rate, buf, latency);
+            if (opened == 0)
+            {
+                attemptLog += (wantExcl ? "excl" : "shared");
+                attemptLog += "@" + juce::String (period) + ":canary-fail ";
+                continue;
+            }
+
+            // Probe callback rate — Tyron's 0.4.1 shared path showed ~2 cb/s.
+            for (auto& p : pairs)
+                if (p != nullptr)
+                    p->resetRateWindow();
+
+            juce::Thread::sleep (400);
+            live = countLiveCallbacks();
+
+            attemptLog += (wantExcl ? "excl" : "shared");
+            attemptLog += "@" + juce::String (period) + ":open=" + juce::String (opened)
+                          + "/live=" + juce::String (live) + " ";
+
+            if (opened == kNumPairs && live == kNumPairs)
+            {
+                usedExclusive = wantExcl;
+                goto aggregate_ok;
+            }
+
+            // Partial: retry dead pairs once at this period/mode.
+            if (opened >= 3 && live < opened)
+            {
+                for (int i = 0; i < kNumPairs; ++i)
+                {
+                    auto& p = pairs[(size_t) i];
+                    if (p == nullptr || ! p->isOpen() || p->callbackDelta() >= 8)
+                        continue;
+                    p->close();
+                    juce::Thread::sleep (40);
+                    auto err = p->open (found[i].name, found[i].typeName,
+                                        preferredSampleRate, preferredBufferSize);
+                    if (err.isNotEmpty())
+                        errors.add ("retry " + juce::String (pairLabel (i)) + ": " + err);
+                }
+
+                for (auto& p : pairs)
+                    if (p != nullptr)
+                        p->resetRateWindow();
+                juce::Thread::sleep (400);
+                live = countLiveCallbacks();
+                opened = 0;
+                for (auto& p : pairs)
+                    if (p != nullptr && p->isOpen())
+                        ++opened;
+                attemptLog += "retry:live=" + juce::String (live) + " ";
+
+                if (opened == kNumPairs && live == kNumPairs)
+                {
+                    usedExclusive = wantExcl;
+                    goto aggregate_ok;
+                }
+            }
         }
-
-        ++opened;
-        rate = pairs[(size_t) i]->sampleRate;
-        buf = juce::jmax (buf, pairs[(size_t) i]->bufferSize);
-        latency = juce::jmax (latency, pairs[(size_t) i]->latencyIn);
     }
 
-    if (opened < kNumPairs)
-    {
-        lastError = "Opened " + juce::String (opened) + "/" + juce::String (kNumPairs)
-                    + " pairs. " + errors.joinIntoString ("; ");
-        // Keep partial open so meters show which pairs work; still mark aggregate.
-    }
-    else
-    {
-        lastError.clear();
-    }
-
+aggregate_ok:
     if (opened == 0)
     {
         closeDevice();
+        lastError = "Aggregate open failed. " + attemptLog + errors.joinIntoString ("; ");
         notifyStatus();
         return lastError;
     }
+
+    // Recompute open stats after possible retries.
+    opened = 0;
+    rate = 0.0;
+    buf = 0;
+    latency = 0;
+    for (auto& p : pairs)
+    {
+        if (p == nullptr || ! p->isOpen())
+            continue;
+        ++opened;
+        rate = p->sampleRate;
+        buf = juce::jmax (buf, p->bufferSize);
+        latency = juce::jmax (latency, p->latencyIn);
+        usedExclusive = usedExclusive || p->typeNameOpen == kExclusiveWasapi;
+    }
+    live = countLiveCallbacks();
 
     aggregateOpen = true;
     primed.store (false, std::memory_order_relaxed);
@@ -597,12 +731,29 @@ juce::String WasapiCapture::openAggregate (double preferredSampleRate, int prefe
     captureSampleRate = rate;
     captureBufferSize = buf;
     deviceLatencyIn = latency;
-    currentName = juce::String (kAggregateName) + " (" + juce::String (opened) + " pairs"
-                  + ", WASAPI " + juce::String (wasapiBufferSize)
-                  + ", depth " + juce::String (latencyMs) + "ms)";
+    currentName = juce::String (usedExclusive ? kAggregateExclusiveName : kAggregateName)
+                  + " (" + juce::String (opened) + " pairs"
+                  + ", " + (usedExclusive ? "excl" : "shared")
+                  + ", WASAPI " + juce::String (buf)
+                  + ", depth " + juce::String (latencyMs) + "ms"
+                  + ", live " + juce::String (live) + "/6)";
+
+    if (opened < kNumPairs || live < kNumPairs)
+    {
+        lastError = "Only " + juce::String (live) + "/6 pairs live (open " + juce::String (opened)
+                    + "). " + attemptLog + errors.joinIntoString ("; ");
+    }
+    else
+    {
+        lastError.clear();
+    }
+
     clearXrunCounters();
+    for (auto& p : pairs)
+        if (p != nullptr)
+            p->resetRateWindow();
     notifyStatus();
-    return opened == kNumPairs ? juce::String() : lastError;
+    return (opened == kNumPairs && live == kNumPairs) ? juce::String() : lastError;
 }
 
 juce::String WasapiCapture::openSingle (const juce::String& deviceName,
@@ -646,6 +797,7 @@ juce::String WasapiCapture::openDevice (const juce::String& deviceName,
                                         int preferredBufferSize)
 {
     // Keep all pairs on one snapped WASAPI period (UI setting wins; else host block).
+    // Aggregate needs ≥1024 in practice; bump quietly (status shows actual).
     if (wasapiBufferSize <= 0 && preferredBufferSize > 0)
         wasapiBufferSize = snapWasapiBuffer (preferredBufferSize);
     else
@@ -654,16 +806,14 @@ juce::String WasapiCapture::openDevice (const juce::String& deviceName,
 
     primed.store (false, std::memory_order_relaxed);
 
+    // Both aggregate menu entries run exclusive-first with shared fallback.
     if (deviceName == kAggregateExclusiveName
-        || deviceName.startsWith (kAggregateExclusiveName))
-    {
-        return openAggregate (preferredSampleRate, preferredBufferSize, true);
-    }
-
-    if (deviceName == kAggregateName
+        || deviceName.startsWith (kAggregateExclusiveName)
+        || deviceName == kAggregateName
         || deviceName.startsWith (kAggregateName))
     {
-        return openAggregate (preferredSampleRate, preferredBufferSize, false);
+        const bool preferExclusive = true;
+        return openAggregate (preferredSampleRate, preferredBufferSize, preferExclusive);
     }
 
     juce::String typeForDevice = kSharedWasapi;
@@ -966,15 +1116,29 @@ juce::String WasapiCapture::getPairHealthSummary() const
 {
     auto pairDiag = [] (const PairEndpoint& p, bool isMaster) -> juce::String
     {
+        const auto now = juce::Time::getHighResolutionTicks();
         const double elapsed = juce::jmax (0.05, juce::Time::highResolutionTicksToSeconds (
-            juce::Time::getHighResolutionTicks() - p.diagEpochTicks));
-        const double cbHz = (double) p.callbackCount.load (std::memory_order_relaxed) / elapsed;
-        const double wrRate = (double) p.samplesWritten.load (std::memory_order_relaxed) / elapsed;
+            now - p.diagEpochTicks));
+        const uint64_t cb = p.callbackCount.load (std::memory_order_relaxed);
+        const uint64_t wr = p.samplesWritten.load (std::memory_order_relaxed);
+        const double cbHz = (double) (cb - p.diagCbAnchor) / elapsed;
+        const double wrRate = (double) (wr - p.diagWrAnchor) / elapsed;
+
+        // Roll the window so status tracks recent rate, not lifetime average.
+        if (elapsed >= 0.75)
+        {
+            p.diagEpochTicks = now;
+            p.diagCbAnchor = cb;
+            p.diagWrAnchor = wr;
+        }
+
         juce::String s;
         s << "fifo=" << p.ring.getAvailableToRead()
           << " cb/s=" << juce::String (cbHz, 1)
           << " wr=" << juce::String (wrRate, 0)
-          << " r=" << juce::String (p.ratio, 3);
+          << " r=" << juce::String (p.ratio, 3)
+          << " " << (p.typeNameOpen == kExclusiveWasapi ? "excl" : "shared")
+          << "@" << p.bufferSize;
         if (p.markedDead || ! p.isCallbackAlive())
             s << " DEAD";
         if (isMaster)

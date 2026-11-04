@@ -17,6 +17,7 @@ public:
     static constexpr const char* kExclusiveWasapi = "Windows Audio (Exclusive Mode)";
 
     static constexpr int kDefaultLatencyMs = 150;
+    /** 1024 is the practical floor for six concurrent WASAPI clients. */
     static constexpr int kDefaultWasapiBuffer = 1024;
     static constexpr const char* kAggregateExclusiveName = "TR-8S (all stems, exclusive)";
     static constexpr int kMinLatencyMs = 40;

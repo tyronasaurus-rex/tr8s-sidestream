@@ -282,8 +282,8 @@ void TR8SSideStreamEditor::updateStatusLabel()
     }
     else
     {
-        s << "Closed. Prefer “TR-8S (all stems)” or “…exclusive”. Depth 150, WASAPI 1024.\n"
-          << "Ableton buffer 512–1024 @ 48 kHz. After Open, status must show cb/s>0 on all pairs.\n"
+        s << "Closed. Open “TR-8S (all stems)” — 0.4.2 uses exclusive WASAPI first.\n"
+          << "Depth 150, WASAPI 1024. After Open expect cb/s~90 wr~48000 excl@1024 on all 6.\n"
           << "Devices: " << proc.getCapture().getDevices().size();
         if (cap.getLastError().isNotEmpty())
             s << "\nLast error: " << cap.getLastError();
