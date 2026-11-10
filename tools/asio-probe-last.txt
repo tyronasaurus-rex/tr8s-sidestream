@@ -1,0 +1,4 @@
+==== RESULTS ====
+ASIO Model Mixer ASIO: cb/s=89.3 wr=45722 (inputs used=12 buf=512) OK
+VERDICT: TR-8S/device ASIO sustains ~48k — sidecar Engine path viable
+Pass gate: wr>=40000 (ideally ~48000). Probe exits after --seconds (default 5).
